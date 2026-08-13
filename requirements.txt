@@ -1,0 +1,7 @@
+# Analysis notebook dependencies. Kept to what analysis.ipynb already imports
+# plus jupyter itself, so a judge can reproduce the plots with
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+pandas>=2.0
+numpy>=1.24
+bokeh>=3.1
+jupyterlab>=4.0

@@ -1,0 +1,72 @@
+================================================================================
+11  OS TUNING — тюнинг ядра и NIC, прогон с таблицей "с/без"
+    день 16 (8 ч; по ветке B — расширяется)
+================================================================================
+решения: D-11 ENA Express выкл
+
+ПРИНЦИП  каждый пункт меряем отдельно и кладём в таблицу "с/без" по p99.9.
+         Половина "общеизвестных" твиков на ENA не работает или вредит.
+
+TIER 1 — основная масса выигрыша
+  ethtool -C eth0 adaptive-rx off rx-usecs 0 tx-usecs 0   # прямая рек. AWS
+  ethtool -G eth0 rx 4096                                 # дефолт 1024
+  echo 2      > /sys/class/net/eth0/napi_defer_hard_irqs  # главный RX-рычаг
+  echo 200000 > /sys/class/net/eth0/gro_flush_timeout
+  systemctl stop irqbalance   # + ENA IRQ на housekeeping-ядра вручную
+  на сокет: SO_BUSY_POLL=50, SO_PREFER_BUSY_POLL=1 (5.11+, feature detect)
+
+  napi_defer_hard_irqs + gro_flush_timeout полностью подавляют хардварные IRQ,
+  пока приложение поллит. Это generic NAPI (5.8+), не ENA-специфика.
+
+BOOT CMDLINE
+  isolcpus=managed_irq,domain,2-9 nohz_full=2-9 rcu_nocbs=2-9
+  intel_idle.max_cstate=1 processor.max_cstate=1 idle=poll
+  tsc=reliable clocksource=tsc nosoftlockup skew_tick=1 audit=0
+  mitigations=off
+
+  mitigations=off важен КОНКРЕТНО потому, что горячий путь syscall-bound
+  (sendmmsg/recvmmsg), а на Sapphire Rapids накладные IBRS/retpoline на
+  входе/выходе из syscall реальны. Показать дельту с и без — легитимный
+  документированный флаг, и показ дельты = хорошая наука.
+  clocksource=tsc проверить фактически: если Nitro отдал kvm-clock,
+  util::now_ns() в САМОМ harness'е дороже и джиттернее (см. файл 01).
+
+RUNTIME
+  sysctl kernel.numa_balancing=0        # миграция страниц = скачки p99.99
+  sysctl net.core.rmem_max/wmem_max=16M
+  sysctl net.core.netdev_max_backlog=8192
+  echo madvise > .../transparent_hugepage/enabled    # НЕ always
+  cpupower frequency-set -g performance              # доступность на
+                                                    # виртуализ. m7i: ПРОВЕРИТЬ
+
+TIER 2 — проверять, а не верить
+  ethtool -K eth0 gro off     для UDP GRO в основном добавляет задержку
+                              коалесцирования. ПРОВЕРИТЬ.
+  RPS/RFS выключить           AWS рекомендует RPS ради пропускной; для
+                              нескольких потоков с busy-poll это IPI + хоп
+                              очереди = ЛАТЕНТНОСТЬ. Противоречие с их же
+                              рекомендацией — измерить и решить.
+  XPS                         привязать ядро TX-потока к конкретной tx-очереди
+                              через .../queues/tx-K/xps_cpus, убить дисперсию
+                              выбора очереди
+  SCHED_FIFO 80               на isolcpus+nohz_full часто НИЧЕГО не даёт и
+                              рискует заморить kernel-треды. Измерить.
+
+В ПРОЦЕССЕ, НЕОБСУЖДАЕМО
+  mlockall(MCL_CURRENT|MCL_FUTURE), prefault + madvise(MADV_HUGEPAGE) всех арен,
+  ноль аллокаций/локов/printf в горячем цикле, MAP_HUGETLB под retransmit-
+  и trace-буферы.
+
+ENA EXPRESS — один эксперимент [D-11]
+  По умолчанию ВЫКЛ: AWS сам пишет "+tens of microseconds" к медиане на
+  лёгком трафике. Это удвоило бы p50.
+  Но заявляет до 85% на p99.9 под нагрузкой -> один прогон на насыщении
+  (нужен m7i.12xlarge+, оба конца, пониженный MTU для UDP).
+  Результат в таблицу компромиссов: цена по p50 против выигрыша по p99.9.
+  Полезна в ЛЮБОМ исходе.
+
+МОНИТОРИТЬ ПОСТОЯННО
+  ethtool -S eth0 | grep -E 'allowance_exceeded|queue_stop|missing|suspend'
+  bw_out_/bw_in_/pps_/conntrack_/linklocal_allowance_exceeded
+  Ненулевой = нас ШЕЙПИТ AWS, и хвост не вина нашего кода. Без этой проверки
+  можно неделю чинить чужую проблему.

@@ -1,0 +1,114 @@
+================================================================================
+99  DIAGNOSTICS — СПРАВОЧНИК: на что смотреть и куда лезть
+    используется на КАЖДОЙ итерации, начиная с файла 06
+================================================================================
+решения: D-26 (приоритет по spread, не по среднему)
+
+ПРАВИЛО ПРИОРИТИЗАЦИИ
+  spread(стадия) = p99.9(стадия) - p50(стадия)
+  Идём в стадию с МАКСИМАЛЬНЫМ spread.
+  вместо "идти где наибольшее среднее": среднее говорит о пропускной
+  способности. Приз дают за джиттер, а джиттер = spread. Стадия может быть
+  медленной, но стабильной — туда лезть незачем.
+
+СТАДИИ
+  #   стадия                          часы                 замечание
+  --------------------------------------------------------------------------
+  S0  producer штампует send_ts_ns    REALTIME, хост A     дано harness'ом
+  S1  sender забрал из SHM ring       TSC_A
+  S2  encode завершён                 TSC_A
+  S3  sendmmsg вернулся               TSC_A
+  S4  kernel TX software ts           REALTIME, A          MSG_ERRQUEUE,
+                                                           ТОЛЬКО на сэмплах
+  S5  NIC HW RX timestamp             домен PHC, хост B    SO_TIMESTAMPING_NEW
+  S6  recvmmsg вернулся               TSC_B
+  S7  decode + publish в SHM          TSC_B
+  S8  consumer штампует recv_ts       REALTIME, B          из --csv, джойн
+                                                           по seq_id
+
+  У ENA HW-таймстемпы ТОЛЬКО НА RX. TX — software через error queue.
+  Значит "провод" = S5 - S4 и включает driver->wire на хосте A.
+  Сказать это в райтапе, а не изображать чистое время провода.
+  ethtool -T eth0 покажет, что реально доступно.
+
+================================ ДЕРЕВО ========================================
+
+S0->S1  publish -> pickup
+  причины  sender вытеснен планировщиком; page fault; producer и sender на
+           гипертред-СИБЛИНГАХ одного ядра; сам build_book пишет 576 B
+  проверка perf sched latency; счётчик nivcsw; трейс backlog'а ring'а
+  фикс     isolcpus + taskset на разные ФИЗИЧЕСКИЕ ядра (lscpu -e);
+           mlockall + prefault; SCHED_FIFO
+
+S1->S2  encode
+  причины  branch miss на предикторе; промахи кэша по состоянию предиктора;
+           АЛЛОКАЦИЯ
+  проверка perf stat -e cache-misses,branch-misses; хук на malloc в debug
+  фикс     branchless-таблицы; состояние предиктора <= 1 кэш-линия на тип;
+           всё предаллоцировано
+
+S2->S3  sendmmsg
+  причины  ENOBUFS/EAGAIN (мал SNDBUF); backpressure qdisc; ШЕЙПИНГ AWS
+           (классика); TX-очередь полна (Large LLQ вдвое режет ring до 512)
+  проверка ethtool -S | grep allowance; tc -s qdisc; счётчик EAGAIN
+  фикс     SO_SNDBUF; tc qdisc replace dev eth0 root noqueue;
+           ПОНИЗИТЬ tier избыточности; ethtool -G tx
+
+S3->S5  стек хоста A + провод
+  причины  джиттер фабрики; не тот AZ / нет placement group;
+           ENA EXPRESS включён на низкой нагрузке (+десятки us!);
+           MTU/фрагментация на L3-хопе
+  проверка сравнить S3->S5 между двумя src-портами; traceroute;
+           ping -M do -s (PMTU)
+  фикс     cluster placement group; выключить ENA Express; payload <=1200 B
+           на L3
+  ЭТУ СТАДИЮ ЧИНИТ ХЕДЖИРОВАНИЕ ПО ПУТЯМ (файл 07)
+
+S5->S6  HW RX -> recvmmsg вернулся
+  причины  latency хардварного IRQ; softirq не запланирован; выход из C-state;
+           переполнение RX ring; хоп через RPS-очередь
+  проверка дельты /proc/interrupts, /proc/softirqs, RcvbufErrors
+  фикс     napi_defer_hard_irqs + gro_flush_timeout + SO_PREFER_BUSY_POLL;
+           ethtool -C rx-usecs 0; ethtool -G rx 4096; выключить RPS;
+           intel_idle.max_cstate=1 idle=poll
+  ЭТУ СТАДИЮ ЧИНИТ AF_XDP (файл 12) — и только её. Не крупнейший spread
+  здесь -> в AF_XDP не лезем вообще.
+
+S6->S7  decode + publish
+  причины  реконструкция 576 B OrderBook = 576 B store на сообщение;
+           промахи по дедуп-битмапу; стойло на THP-компактизации
+  проверка perf stat; compact_stall в /proc/vmstat
+  фикс     non-temporal stores в слот; битмап под размер L2;
+           transparent_hugepage=madvise (НЕ always)
+  ЭТУ СТАДИЮ УЛУЧШАЕТ --deliver slim (файл 08): -500 B store на book
+
+S7->S8  publish -> consumer прочитал
+  причины  CONSUMER ЗАЛАПЛЕН (особенно с --csv); consumer не запинен или на
+           гипертред-сиблинге
+  проверка наш счётчик published против их received
+  фикс     запинить consumer; ЧЕСТНО отчитаться о расхождении; патч --csv
+           отдельным диффом [D-20]
+
+SPREAD РОВНЫЙ ПО ВСЕМ СТАДИЯМ
+  это проблема ЧАСОВ/TSC, а не латентности: kvm-clock вместо tsc,
+  рекалибровка TSC, шаг chrony
+  проверка current_clocksource; chronyc tracking до и после
+  фикс     clocksource=tsc; makestep 0 0; прогоны 10-30 с
+
+SPREAD В НЕСКОЛЬКИХ ОКНАХ ПО 100 мс
+  steal time / шумный сосед / исчерпание burst-кредитов
+  проверка steal из /proc/stat; *_allowance_exceeded
+  фикс     non-burstable размер инстанса; перепрогон; УКАЗАТЬ какие окна
+           исключены и почему (молча выбрасывать нельзя)
+
+================================================================================
+БЫСТРАЯ ПАМЯТКА "КОГДА ЧТО"
+  бимодальное распределение        -> C-states или freq scaling
+  скачки строго каждые N мс        -> timer tick / THP compaction / flush CSV
+  хвост коррелирует с потерями     -> путь восстановления (файл 07)
+  хвост растёт с fan-out           -> TX-цикл sender'а (файл 10)
+  хвост растёт с rate ЛИНЕЙНО      -> упёрлись, ищем bottleneck-стадию
+  хвост растёт с rate РЕЗКО        -> точка излома, смотрим allowance-счётчики
+  всё хорошо, но dropped > 0       -> лапанье: наше на producer-ring или
+                                      consumer'а на нашем ring
+================================================================================
