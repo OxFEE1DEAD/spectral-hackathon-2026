@@ -1,0 +1,6 @@
+message,before_bytes,after_bytes
+Trade,192,80
+Bbo,192,64
+OrderBook,576,160
+mixed average,320,101
+shm ring slot,640,192

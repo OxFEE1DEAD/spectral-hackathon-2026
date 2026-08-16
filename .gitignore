@@ -1,0 +1,23 @@
+# Build output
+bin/
+*.o
+
+# Measurement output. The raw per-message samples are hundreds of megabytes per
+# configuration and are not committed; the small aggregates the notebook plots from
+# are, so every figure can be regenerated and reviewed in a diff.
+data/*
+!data/plots/
+data/plots/*
+!data/plots/*.csv
+*.json.gz
+
+# Capture files never belong in this repository.
+*.pcap
+*.pcapng
+
+# Local bench configuration: hostnames, addresses and interface names of the
+# machines you measure on. Never committed -- see scripts/bench.env.example.
+scripts/bench.env
+
+# Jupyter writes these next to the notebook.
+.ipynb_checkpoints/
