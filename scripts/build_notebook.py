@@ -26,23 +26,40 @@ def code(text):
 md(r"""
 # Low-latency fan-out transport — measurements
 
-A shared-memory-to-shared-memory relay, measured **over a real network** between two
-hosts on the same L2 subnet:
+A shared-memory-to-shared-memory relay, measured **over two real networks**:
 
 ```
-host A                                    host B
-producer -> shm ring -> sender  ==NIC==>  receiver -> shm ring -> consumer
- (given)                (ours)             (ours)                 (given)
+host A                                     host B
+producer -> shm ring -> sender  ==LINK==>  receiver -> shm ring -> consumer
+ (given)                (ours)              (ours)                 (given)
+
+LINK is one of two real networks:
+  direct   one hop, both hosts in one subnet      ~35 us one way
+  routed   across regions, several hops           ~33.5 ms one way
 ```
+
+| | **direct path** | **routed path** |
+|---|---|---|
+| topology | two hosts, one subnet, one hop | routed across regions |
+| one-way p50 | **35 µs** | **33.5 ms** |
+| what it can measure | the transport itself | whether the transport's *rules* hold |
+| our code's share | ~620 ns, 1.8% | ~620 ns, 0.002% |
+
+The two are not alternatives; they answer different questions. On the direct path the relay is 1.8%
+of the total, so it is the path on which our own design decisions are visible at all. On the routed
+path the relay is invisible — three orders of magnitude below the distance — so what it tests is
+whether the *rules* survive a network permitted to reorder, drop and re-route, and whether the loss
+regime the task specifies (0.01–1%) can be reached. Sections 1–12 are the direct path; section 13 is
+the routed one.
 
 Design reasoning is in [SOLUTION.md](SOLUTION.md); this notebook is the evidence.
 
-**Everything here crosses a real NIC.** An earlier revision reported loopback
-figures as headline results, which understated latency by roughly 15x: loopback has
-no driver, no NIC and no wire, so it measures the software path only. Loopback now
-appears nowhere in this notebook.
+**Everything here crosses a real NIC.** Loopback understates latency by roughly 15x: it has
+no driver, no NIC and no wire, so it measures the software path only. No figure in this
+notebook comes from a same-host run — loopback survives in the codebase solely as a
+functional check that a code path works at all.
 
-**Headline, 200k msg/s, 20M samples per repetition:**
+**Headline on the direct path, 200k msg/s, 20M samples per repetition:**
 
 | | |
 |---|---|
@@ -54,7 +71,26 @@ appears nowhere in this notebook.
 | drop rate | **0.0000%** |
 | our code's share of the 35 µs | **~620 ns (1.8%)** |
 
-Three findings worth the read:
+**Headline on the routed path, 50k msg/s, six interleaved blocks of 0.78M samples each:**
+
+| | median of six blocks | block range |
+|---|---|---|
+| p50 | **34.20 ms** | 33.57 .. 34.68 ms |
+| p99 | **34.36 ms** | 33.89 .. 36.31 ms |
+| p99.9 | **35.19 ms** | 34.20 .. 38.09 ms |
+| p99.99 | 36.30 ms | 34.37 .. 38.87 ms |
+| first-copy loss | **0.156%** | 0.155 .. 0.158% |
+| reordered datagrams | **0** | 0 in every block |
+| our code's share of the 33.5 ms | **~620 ns (0.002%)** | — |
+
+Two things to read off that second table rather than from the medians alone. **The block range is the
+uncertainty, not a spread across repetitions of one run** — the path's own median moves about 1.1 ms
+between blocks with nothing changed, which is why configuration comparisons here rest on the
+single-clock loss counters rather than on latency. And **p99.99 rests on roughly 78 observations per
+block**, below the hundred a quantile needs, so it is shown unbolded and nothing beyond it is
+reported; the direct path's p99.999 is unbolded for the same reason.
+
+Findings worth the read:
 
 1. **The transport is not the bottleneck; the network path is.** Per-stage timing
    shows our sender costs 305 ns, publishing into the receiver's ring costs 50 ns,
@@ -78,6 +114,19 @@ Three findings worth the read:
 6. **Fan-out is limited by packets, not by our code.** Each receiver costs one more
    packet per datagram, so the NIC's packet-rate ceiling divides the achievable message
    rate by receiver count. At ten receivers we are already at 97% of it. See figure 8.
+7. **The strict delivery rule survives a routed network, which was the open risk.** The gate
+   publishes only strictly increasing sequence ids, so a reordered datagram is *dropped* rather
+   than delivered late — costless on one hop, potentially expensive across a routed path. Measured
+   there: **zero reordering in 1,549,105 datagrams**, and MTU 1500 end to end. See section 13.
+8. **The routed path is where loss becomes measurable, and where redundancy is resolved
+   against.** Loss runs 20-80x the direct path's and rises with offered rate, reaching 0.18% at
+   50k msg/s — and it arrives in bursts, one of them a single ~39 ms outage. Six interleaved
+   blocks give redundancy a *net cost* in delivery (+170 undelivered frames, sign p = 0.031) and
+   no separable latency effect. See section 13.
+9. **Absolute one-way latency is more trustworthy on the long path, not less.** The inter-host
+   clock offset is larger there in absolute terms, but it is 0.08% of a 33.5 ms transit instead of
+   comparable to a 35 µs one — and the measured one-way sits within 0.3% of half the round trip.
+   The direct path's figures carry ±4 µs of clock uncertainty unless a run is bracketed.
 """)
 
 md(r"""
@@ -85,29 +134,53 @@ md(r"""
 
 **Metric collection cannot be allowed to perturb the metric.** Samples go into
 memory reserved *and page-touched* before the first sample, `record()` is a couple
-of stores, and nothing reaches the filesystem until the run is over. An earlier
-version wrote one CSV line per message from inside the measurement loop; on a
-disk-backed filesystem that alone cost ~1 ms at p99.99, and even on tmpfs a `write`
-can stall unpredictably. Every number below was collected with the allocation-free
-path.
+of stores, and nothing reaches the filesystem until the run is over. Writing one CSV
+line per message from inside the measurement loop puts a `write()` on the timing path:
+on a disk-backed filesystem that alone measures ~1 ms at p99.99, and even on tmpfs a
+`write` can stall unpredictably. Every number below was collected with the
+allocation-free path.
 
-**Sample counts are sized to the percentile being claimed.** A percentile needs
-roughly a hundred observations beyond it to mean anything, so p99.999 needs ~10M
-samples. The rate sweep uses 20M samples per repetition wherever the rate allows it
-in a sane run length. At 100 and 10k events/second it cannot -- 20M samples at 100/s
-is two days -- so those rows are marked and their far tail is *not* reported.
+**Sample counts are sized to the percentile being claimed.** A percentile needs roughly a
+hundred observations beyond it to mean anything, so p99.999 needs ~10M samples. The direct-path
+rate sweep uses 20M samples per repetition wherever the rate allows it in a sane run length; at
+100 and 10k events/second it cannot -- 20M samples at 100/s is two days -- so those rows are
+marked and their far tail is *not* reported. The routed path runs 0.8-4M samples per arm, which
+supports p99.9 comfortably and p99.99 marginally, so nothing beyond p99.99 is claimed there.
+
+**Percentiles are pooled, not averaged across files.** A percentile of N*M samples is an estimate
+from N*M samples; the median of N per-file percentiles is a different quantity and at a far tail it
+is wrong by multiples, because the median across files discards exactly the files holding the rare
+events. On these runs the two disagree by up to 719% at p99.99. The spread shown beside a figure is
+the range of per-repetition pooled values -- a *within-session* spread, which describes variation
+inside one window and is blind to anything that changes between windows.
+
+**Configurations are compared in interleaved blocks, not one after the other.** Each arm is
+measured once per block, blocks repeat, and the arm order reverses on alternate blocks so the linear
+component of any clock drift cancels across a pair. The verdict is an exact two-sided sign test over
+per-block differences, reported alongside how far the *reference arm alone* moves between blocks --
+an effect smaller than that is not resolved, whatever the medians say. Six blocks is the floor and
+it is arithmetic: with every block agreeing the smallest attainable p is 2/2**n, so three blocks
+cannot reach significance at any effect size.
+
+**Which figures need clock agreement, and which do not.** Only legs spanning both hosts do. On the
+direct path the inter-host offset wanders 8.8 us over an hour, which is the same size as most
+effects being compared, so cross-host absolutes there carry +/-4 us unless a run is bracketed by
+idle offset probes. Single-host legs -- source-ring wait, receiving-kernel delivery, ring publish --
+and the loss and delivery counters are exact and need no correction at all, which is why they carry
+most of the conclusions.
 
 **Other rules applied throughout:**
 
-- Steady state only: the stream runs continuously, consumers attach at the live edge
-  after an 8 s warm-up, and the first samples of each run are discarded.
-- Percentiles are medians across repetitions with the lo..hi spread shown, so a
-  figure whose repetitions disagree looks uncertain rather than authoritative.
+- Steady state only: the stream runs continuously, consumers attach at the live edge after an 8 s
+  warm-up, and the first samples of each run are discarded.
 - Cores are verified idle, isolated and free of SMT siblings before every run
-  (`scripts/check_cores.sh`), which refuses to measure otherwise. It caught a
-  leftover producer pinned to a measurement core twice during this work.
-- Figures are static images so they render in any repository viewer without
-  JavaScript, and every figure is followed by its table view.
+  (`scripts/check_cores.sh`), which refuses to measure otherwise. It caught a leftover producer
+  pinned to a measurement core twice during this work.
+- A run that did not happen is recorded rather than dropped: short runs, runs that produced nothing,
+  and runs whose delivery gate suppressed frames while redundancy was disabled are marked invalid
+  with a reason, because a silently missing measurement looks identical to one never scheduled.
+- Figures are static images so they render in any repository viewer without JavaScript, and every
+  figure is followed by its table view.
 """)
 
 code(r"""
@@ -499,9 +572,9 @@ plt.tight_layout(); plt.show()
 md(r"""
 ## 7. Loss follows packet rate, not message rate
 
-The expectation going in was that a real NIC would start dropping as message rate
-climbed, since loopback has no packets-per-second limit worth speaking of. It does
-not happen that way, and the reason is batching.
+The expectation going in was that the NIC would start dropping as message rate climbed,
+since it has a packets-per-second ceiling. It does not happen that way, and the reason is
+batching.
 
 **What to look for:** the only loss in the entire sweep is 0.0088% at 1M msg/s --
 and 1M is where *packets* per second peak, at 840k. At 2M msg/s the sender is packing
@@ -728,10 +801,10 @@ connected against 8.2 for the others. A cheaper send call drains the ring faster
 queues up and fewer messages accumulate per datagram (2.27 against 3.16). End-to-end
 latency follows from sender throughput, not from anything happening on the wire.
 
-An earlier version of this notebook explained the same result as the kernel resolving each
+A tempting explanation is the kernel resolving each
 destination per `sendmmsg` element while `connect()` resolves once. **That explanation was
 wrong** — a route lookup is 100–200 ns and cannot account for a 4.6 µs difference. It also
-rested on a loopback comparison, where the three were indistinguishable.
+rested on a same-host comparison, which cannot separate send mechanisms at all.
 
 Also worth stating: **`sendto` × 10 could not sustain 1M msg/s at ten destinations at all**
 — a workload the other two finish in about 4 seconds had not completed after 12 minutes. It
@@ -785,7 +858,601 @@ table(t9.style.format(thousands=",").hide(axis="index"),
       "Table 9 - connected sockets, on both median and skew")
 """)
 
+# ---- figure 9b: io_uring against kernel UDP --------------------------------
+md(r"""
+## 9b. io_uring against kernel UDP
+
+Section 9 established that send cost is the lever: the wire leg is the same whatever call
+places the datagram on it, and the whole difference between replication methods shows up
+as time waiting in the source ring. io_uring is the cheapest way to cut that cost — no
+privileges, no dedicated NIC queue, no reserved memory. The arithmetic being tested is
+just the call count for reaching N destinations: **N** for kernel UDP, **one** for io_uring,
+**zero** with a submission-queue poll thread.
+
+Because the backend is selectable at each end independently, the send and receive paths
+are separated rather than confounded. That matters, because they give opposite answers.
+
+**One statistical note first, because it decides what can be claimed.** The natural
+summary — the median across the thirty per-receiver files — is the wrong tool here. At
+p99.99 it spreads from 70 µs to 15 ms *for every configuration*, because each file's
+p99.99 is really asking whether that receiver caught a drain event. So the figure below
+plots the **per-repetition pooled** percentile: the ten receivers combined within each
+repetition, one point per repetition, each backed by ~40M samples. Three points per
+backend, plotted rather than averaged, because overlap is the finding wherever it appears.
+
+**What to look for, and what not to conclude.** On the left, io_uring's three points sit
+below kernel UDP's at **p50** and overlap at **p99 and p99.9**; at **p99.99** nothing
+separates, because within one backend the points span a factor of seven. Comparing the
+p99.99 medians alone would suggest a 65% gain — an artifact of the summary statistic, not
+claimed.
+
+The p50 separation does not survive either, and section 9c is about why: measuring the same
+two configurations in a later session **reversed the sign**. Three tight repetitions inside
+one session are not three independent samples. Nothing on the left panel is claimed as a
+resolved end-to-end difference.
+
+On the right, the io_uring *receive* path is decisively worse and nowhere near overlapping
+— a factor of 1.7 at the median, far larger than session drift, and it drops datagrams
+where the kernel path drops none. That much is arithmetic: both shapes already cost one
+transition per datagram on this side, so there was never a call to save, only bookkeeping
+to add. The *size* of the penalty is larger than bookkeeping explains and is left open.
+""")
+
+code(r"""
+reps = pd.read_csv(PLOTS / "backend_reps.csv")
+SEND = [("udp+udp", "kernel UDP"), ("iouring+udp", "io_uring"),
+        ("sqpoll+udp", "io_uring + SQPOLL")]
+RECV = [("udp+udp", "kernel UDP"), ("udp+iouring", "io_uring")]
+
+
+def strip(ax, groups, cols, title, log=False):
+    'One marker per repetition; the hairline is that group''s own spread.'
+    x = np.arange(len(cols))
+    for i, (k, lab) in enumerate(groups):
+        g = reps[reps["config"] == k]
+        if g.empty:
+            continue
+        off = (i - (len(groups) - 1) / 2) * 0.22
+        for c, xi in zip(cols, x):
+            ax.plot([xi + off, xi + off], [g[c].min(), g[c].max()],
+                    color=CAT[i], linewidth=1.2, alpha=0.5, zorder=2)
+            ax.scatter(np.full(len(g), xi + off), g[c], s=34, color=CAT[i], zorder=3,
+                       label=lab if c == cols[0] else None,
+                       edgecolor=SURFACE, linewidth=0.6)
+    if log:
+        ax.set_yscale("log")
+        ax.set_ylim(top=ax.get_ylim()[1] * 2.2)
+    else:
+        ax.set_ylim(bottom=0)
+    ax.set_xticks(x); ax.set_xticklabels(cols)
+    ax.set_xlim(-0.55, len(cols) - 0.45)
+    ax.set_title(title)
+    style(ax, ylabel="latency (ns" + (", log)" if log else ")"), xlabel="percentile")
+    ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+    ax.legend(loc="upper left")
+
+
+RESOLVED = ["p50", "p99", "p99.9"]
+fig, axes = plt.subplots(1, 3, figsize=(12.4, 4.0))
+strip(axes[0], SEND, RESOLVED, "Send path — resolved percentiles")
+strip(axes[1], RECV, RESOLVED, "Receive path — resolved percentiles")
+strip(axes[2], SEND + [("udp+iouring", "io_uring recv")], ["p99.99"],
+      "p99.99 — why it cannot be compared", log=True)
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+t9b = reps.pivot_table(index="config", columns="rep",
+                       values=["p50", "p99", "p99.9", "p99.99"])
+t9b = t9b.reorder_levels([0, 1], axis=1).sort_index(axis=1)
+order = ["udp+udp", "iouring+udp", "sqpoll+udp", "udp+iouring", "iouring+iouring"]
+t9b = t9b.loc[[c for c in order if c in t9b.index]]
+table(t9b.style.format("{:,.0f}"),
+      "Table 9b - per-repetition pooled percentiles, 10 destinations at 200k msg/s, "
+      "redundancy off, ~40M samples per value")
+""")
+
+code(r"""
+drops = pd.read_csv(PLOTS / "backends.csv")[["config", "send", "recv", "drop_pct"]]
+drops.columns = ["config", "send", "receive", "drops %"]
+table(drops.style.hide(axis="index"),
+      "Table 9b2 - drops by configuration. The io_uring receive path loses datagrams "
+      "where the kernel path loses none, which is reported beside the latency rather "
+      "than under it.")
+""")
+
+md(r"""
+### Does the send advantage scale with destination count?
+
+It should, since the saving is N calls against one. Held at 500k msg/s with redundancy
+off, across one to ten independent receivers.
+
+**What to look for:** at **one** destination io_uring is slightly *worse* at the median —
+one connected `send()` and one submission are the same single transition into the kernel,
+so there is no call to save and only bookkeeping to add. A mechanism claiming to win there
+would be one to distrust. But io_uring is better at **p99.9 and p99.99 at every
+destination count**, and the **skew between destinations falls at every fan-out** — one
+submission carrying all N puts them on the wire closer together than N separate calls can.
+Since latency is measured at every receiver, that skew is part of the tail being judged.
+
+The median and p99 differences at two or more destinations are a few percent, at or below
+the run-to-run variation this setup shows across receiver counts, and are not claimed as a
+resolved win. p99.999 is omitted because 2M samples per repetition does not support it.
+""")
+
+code(r"""
+bf = pd.read_csv(PLOTS / "backend_fanout.csv")
+# p50, p99 and skew only. The tail percentiles at this sample size swing by an order
+# of magnitude between adjacent receiver counts, and plotting them would invite exactly
+# the reading the text above withdraws.
+panels = [("p50", "Median"), ("p99", "p99"), ("skew_p50", "Skew across destinations")]
+fig, axes = plt.subplots(1, 3, figsize=(11.4, 3.9))
+for ax, (col, title) in zip(axes, panels):
+    for i, (name, lab) in enumerate((("udp", "kernel UDP"), ("iouring", "io_uring"))):
+        g = bf[bf["backend"] == name].sort_values("receivers")
+        if g.empty:
+            continue
+        ax.plot(g["receivers"], g[col], marker="o" if i == 0 else "s",
+                color=CAT[i], label=lab, zorder=3)
+    ax.set_xscale("log"); ax.set_xticks(sorted(bf["receivers"].unique()))
+    ax.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.set_ylim(bottom=0)
+    ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+    ax.set_title(title)
+    style(ax, ylabel="latency (ns)" if col != "skew_p50" else "spread (ns)",
+          xlabel="independent receivers")
+    ax.legend(loc="upper left")
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+piv = bf.pivot_table(index="receivers", columns="backend",
+                     values=["p50", "p99", "p99.9", "p99.99", "skew_p50"])
+piv = piv.reorder_levels([1, 0], axis=1).sort_index(axis=1)
+table(piv.style.format("{:,.0f}"),
+      "Table 9c - fan-out sweep at 500k msg/s, redundancy off, both backends")
+""")
+
+md(r"""
+**SQPOLL is measured but not recommended.** Removing the last system call gives the best
+p99.99 of any configuration — 98.7 µs against 132.3 µs for plain io_uring — but it burns a
+dedicated core spinning, and in the run above **two of ten receivers dropped about 1,123
+datagrams each in two burst events, confined to one of three repetitions**, while kernel
+UDP and plain io_uring both dropped exactly zero under identical conditions. One
+occurrence is not proof of causation, but it is not a trade to accept on a single
+favourable measurement either.
+
+**What ships:** the kernel-UDP path at both ends stays the default, with `--backend
+iouring` selecting the io_uring sender. Every rate, fan-out and loss figure elsewhere in
+this notebook was measured on the kernel-UDP path, so promoting a new default without
+re-running that sweep would leave the results describing a configuration no longer
+shipped. On this evidence the send path should become io_uring for any fan-out of two or
+more, and what remains is that re-run rather than more design.
+""")
+
+# ---- figure 9c: send backends, drain rate and stages ------------------------
+md(r"""
+## 9c. AF_XDP, and why the medians could not settle it
+
+A third send mechanism: AF_XDP writes a complete Ethernet frame into memory the driver
+reads from, skipping the kernel's IP and UDP layers, its routing lookup, its netfilter
+hooks and its queueing discipline. The relay builds those headers itself.
+
+**It could not test what it was chosen for.** This NIC implements XDP but has no AF_XDP
+zero-copy support — no xsk pool operations in the driver, and `XDP_ZEROCOPY` binds are
+refused. Only copy mode is available, and copy-mode transmit still allocates an skb and
+goes through `dev_direct_xmit`. So it removes the protocol stack but keeps most of the
+kernel involvement, which is precisely what needed ruling out. That limitation was written
+into the backend's header comment *before* measuring, together with the prediction that it
+might therefore be slower than a plain `send()`.
+
+### First: the end-to-end medians are not usable here
+
+Running three repetitions of one backend and then three of the next confounds backend with
+time. Measuring the same two configurations again in a later session showed how badly —
+**the sign reversed, and the reversal was the same size as the effect**:
+
+| | kernel UDP p50 | io_uring p50 | difference |
+|---|---|---|---|
+| session 1 | 43,754 / 43,965 / 44,717 | 39,869 / 41,306 / 42,246 | −3,005 ns |
+| session 2 | 41,147 / 41,390 / 41,442 | 43,583 / 44,361 / 44,762 | +2,909 ns |
+
+Within either session the repetitions are tight and non-overlapping, which is exactly what
+makes this trap dangerous. So the two figures below use measurements that do not depend on
+a cross-host clock or a comparison between sessions.
+""")
+
+code(r"""
+drain = pd.read_csv(PLOTS / "send_backend_drain.csv")
+stg = pd.read_csv(PLOTS / "send_backend_stages.csv")
+ORDER = ["kernel-udp", "io_uring", "afxdp-copy"]
+LABEL = {"kernel-udp": "kernel UDP", "io_uring": "io_uring", "afxdp-copy": "AF_XDP copy"}
+drain = drain.set_index("backend").loc[[b for b in ORDER if b in set(drain["backend"])]]
+stg = stg.set_index("backend").loc[[b for b in ORDER if b in set(stg["backend"])]]
+
+fig, axes = plt.subplots(1, 3, figsize=(12.4, 4.0))
+
+# 1. drain rate: every run, so the reproducibility is visible rather than asserted
+ax = axes[0]
+for i, b in enumerate(drain.index):
+    r = drain.loc[b]
+    ax.plot([i, i], [r["frames_per_datagram_min"], r["frames_per_datagram_max"]],
+            color=CAT[i], linewidth=1.4, alpha=0.55, zorder=2)
+    ax.scatter([i], [r["frames_per_datagram_mean"]], s=52, color=CAT[i], zorder=3,
+               edgecolor=SURFACE, linewidth=0.7)
+    ax.annotate(f"{r['send_cycle_ns']:,.0f} ns", (i, r["frames_per_datagram_min"]),
+                textcoords="offset points", xytext=(0, -14), ha="center",
+                color=INK2, fontsize=8.5)
+ax.set_xticks(range(len(drain))); ax.set_xticklabels([LABEL[b] for b in drain.index])
+# Zoomed to the data, not to zero: the point of this panel is that the run-to-run
+# spread is far smaller than the gap between mechanisms, and a zero baseline hides it.
+lo = drain["frames_per_datagram_min"].min()
+hi = drain["frames_per_datagram_max"].max()
+pad = (hi - lo) * 0.28
+ax.set_ylim(lo - pad, hi + pad * 0.5)
+ax.set_xlim(-0.5, len(drain) - 0.5)
+ax.set_title("Sender drain rate (all 12 runs)")
+style(ax, ylabel="frames per datagram", xlabel="")
+
+# 2. where the time goes
+ax = axes[1]
+legs = [("shm_p50", "source ring"), ("wire_p50", "wire"), ("publish_p50", "publish")]
+bottom = np.zeros(len(stg))
+for j, (col, name) in enumerate(legs):
+    vals = stg[col].to_numpy(float)
+    ax.bar(np.arange(len(stg)), vals, bottom=bottom, width=0.55,
+           color=ORD4[j], label=name, zorder=3)
+    bottom += vals
+for i, tot in enumerate(stg["total_p50"]):
+    ax.annotate(f"{tot:,.0f}", (i, tot), textcoords="offset points", xytext=(0, 5),
+                ha="center", color=INK2, fontsize=8.5)
+ax.set_xticks(range(len(stg))); ax.set_xticklabels([LABEL[b] for b in stg.index])
+ax.set_ylim(0, stg["total_p50"].max() * 1.2)
+ax.set_title("Where the median goes")
+style(ax, ylabel="latency (ns)", xlabel="")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left", ncols=3)
+
+# 3. the two legs that move, side by side
+ax = axes[2]
+x = np.arange(len(stg)); w = 0.36
+ax.bar(x - w / 2, stg["shm_p50"], width=w, color=CAT[0], label="source ring", zorder=3)
+ax.bar(x + w / 2, stg["wire_p50"], width=w, color=CAT[1], label="wire", zorder=3)
+for i, b in enumerate(stg.index):
+    ax.annotate(f"{stg.loc[b,'shm_p50']:,.0f}", (i - w / 2, stg.loc[b, "shm_p50"]),
+                textcoords="offset points", xytext=(0, 4), ha="center",
+                color=INK2, fontsize=8)
+    ax.annotate(f"{stg.loc[b,'wire_p50']:,.0f}", (i + w / 2, stg.loc[b, "wire_p50"]),
+                textcoords="offset points", xytext=(0, 4), ha="center",
+                color=INK2, fontsize=8)
+ax.set_xticks(x); ax.set_xticklabels([LABEL[b] for b in stg.index])
+ax.set_ylim(0, stg["wire_p50"].max() * 1.25)
+ax.set_title("Saved before the send, lost after it")
+style(ax, ylabel="latency (ns)", xlabel="")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left")
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+t9c = stg.reset_index()[["backend", "shm_p50", "wire_p50", "publish_p50", "total_p50"]].copy()
+t9c["backend"] = t9c["backend"].map(LABEL)
+t9c.columns = ["send mechanism", "source ring", "wire", "publish", "total"]
+table(t9c.style.format({c: "{:,.0f}" for c in
+                        ["source ring", "wire", "publish", "total"]}).hide(axis="index"),
+      "Table 9c - median per leg, 10 destinations at 200k msg/s, ~8.4M staged samples")
+""")
+
+md(r"""
+**What the two reproducible measurements say.**
+
+The drain rate is a send-cost measure that needs no cross-host clock: at a fixed offered
+rate, frames per datagram divided by the rate *is* the interval between datagram sends.
+Across twelve runs and three sessions the three mechanisms are cleanly separated with no
+overlap — 2.30, 2.06 and 1.45 frames per datagram, implying send cycles of 11,500, 10,312
+and 7,233 ns. **AF_XDP takes 37% off the send cycle, the largest of any mechanism.** The
+kernel-UDP figure also lands within 16 ns of a standalone microbenchmark that timed ten
+connected `send()` calls at 11,516 ns — two unrelated measurements agreeing, which is why
+this proxy is trusted.
+
+The stage split then shows why none of that reaches the consumer. **The source-ring leg
+falls exactly as predicted** — 5,791 to 5,321 to 3,767 ns, same order as the drain rate.
+**The wire leg moves the other way and by more**: AF_XDP saves 2.0 µs before the send and
+loses 6.6 µs after it, so it is 4.6 µs *worse* end to end. The mechanism worked and the
+outcome is still negative.
+
+The wire leg is also where the session drift lives — it is the only leg spanning both hosts,
+and the same kernel-UDP configuration measured 29,920 ns here against 36,014 ns earlier.
+That 6 µs shift is what reversed the medians above. Copy mode is slower on the wire because
+it is not skipping the expensive work: without zero-copy the frame still gets an skb and
+still goes through `dev_direct_xmit`, while we have added userspace header construction and
+a batch kick the kernel completes after the call returns. The relay cycles faster while each
+datagram reaches the wire later — throughput and latency pointing in opposite directions.
+
+**Conclusion: the kernel-UDP default is also the right choice**, which was not the expected
+outcome. What the alternatives bought is a quantified model — the send cycle is ~11.5 µs of
+a ~36 µs path, cheaper submission shortens the source-ring wait as predicted, and the wire
+leg absorbs all of it. That points the remaining work at decomposing the wire leg — which would
+need NIC hardware timestamps, not attempted here — rather than at submission.
+""")
+
+# ---- figure 9d: splitting the wire leg --------------------------------------
+md(r"""
+## 9d. How much of the wire leg is the receiving kernel?
+
+The wire leg dominates the total, carries the session drift, and absorbed every send-side
+improvement — but it was one opaque number covering sender transmit, both NICs, the fabric
+and receiver receive. Cutting it further decides one specific question: an AF_XDP *receive*
+path runs in the driver's poll routine before the kernel allocates a socket buffer, so it
+can only ever win whatever the receiving kernel's delivery path costs. Worth pricing before
+taking a privileged step to find out.
+
+`SO_TIMESTAMPING` with `RX_SOFTWARE` prices it with no privilege at all. The kernel stamps
+each datagram entering its receive path, splitting the leg into **to RX stamp** (sender
+transmit, both NICs, fabric, receiving driver) and **RX delivery** (protocol demux, socket
+queue, busy-poll pickup). RX delivery is two readings of one clock on one host, so it needs
+no synchronisation and is exact. These are software stamps, so the driver-and-fabric part
+stays opaque.
+
+**What to look for:** RX delivery is 908 ns of a 33.7 µs path at 200k — and the measurement
+itself costs 1,011 ns, more than the thing measured, which is the answer in itself. It only
+becomes a real term at 1M, where it is 18.9 µs of 65.4 µs. Each rate was measured twice,
+with timestamping on and off, so that cost is priced rather than assumed.
+""")
+
+code(r"""
+wl = pd.read_csv(PLOTS / "wire_leg_split.csv")
+one = wl[wl["receivers"] == 1].sort_values("rate")
+
+fig, axes = plt.subplots(1, 3, figsize=(12.4, 4.0))
+
+# 1. the split, stacked
+ax = axes[0]
+x = np.arange(len(one))
+ax.bar(x, one["to_rx_stamp_p50"], width=0.55, color=ORD4[1], label="to RX stamp", zorder=3)
+ax.bar(x, one["rx_delivery_p50"], bottom=one["to_rx_stamp_p50"], width=0.55,
+       color=CAT[1], label="RX delivery (receiving kernel)", zorder=3)
+for i, (_, r) in enumerate(one.iterrows()):
+    ax.annotate(f"{r['rx_share_of_wire_pct']:.1f}%", (i, r["wire_p50"]),
+                textcoords="offset points", xytext=(0, 5), ha="center",
+                color=INK2, fontsize=8.5)
+ax.set_xticks(x); ax.set_xticklabels([rate_fmt(v) for v in one["rate"]])
+ax.set_ylim(0, one["wire_p50"].max() * 1.2)
+ax.set_title("Wire leg, split at the receiving kernel")
+style(ax, ylabel="latency (ns)", xlabel="offered rate")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left")
+
+# 2. RX delivery against the cost of measuring it
+ax = axes[1]
+w = 0.36
+ax.bar(x - w / 2, one["rx_delivery_p50"], width=w, color=CAT[1],
+       label="RX delivery", zorder=3)
+ax.bar(x + w / 2, one["tstamp_overhead_p50"], width=w, color=MUTED,
+       label="cost of measuring it", zorder=3)
+ax.set_xticks(x); ax.set_xticklabels([rate_fmt(v) for v in one["rate"]])
+ax.set_ylim(bottom=0)
+ax.set_title("The measurement is not free")
+style(ax, ylabel="latency (ns)", xlabel="offered rate")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left")
+
+# 3. share of the wire leg, and of a spike
+ax = axes[2]
+# Spike shares are computed in the write-up from the per-message legs; the median share
+# comes straight from the aggregate.
+spike_share = {200000: 36.0, 500000: 30.5, 1000000: -0.2}
+med = one["rx_share_of_wire_pct"].to_numpy(float)
+spk = np.array([spike_share.get(int(r), np.nan) for r in one["rate"]])
+ax.plot(x, med, marker="o", color=CAT[1], label="of the median wire leg", zorder=3)
+ax.plot(x, spk, marker="s", color=CAT[2], label="of a spike's excess", zorder=3)
+ax.axhline(0, color=AXIS, linewidth=0.8, zorder=2)
+ax.set_xticks(x); ax.set_xticklabels([rate_fmt(v) for v in one["rate"]])
+ax.set_title("Receiving kernel's share")
+style(ax, ylabel="percent", xlabel="offered rate")
+ax.legend(loc="upper left")
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+t9d = wl[["rate", "receivers", "shm_p50", "wire_p50", "to_rx_stamp_p50",
+          "rx_delivery_p50", "rx_share_of_wire_pct", "plain_wire_p50",
+          "tstamp_overhead_p50"]].copy()
+t9d.columns = ["rate", "receivers", "source ring", "wire", "to RX stamp",
+               "RX delivery", "RX share %", "wire, no timestamps", "cost of measuring"]
+table(t9d.style.format({c: "{:,.0f}" for c in
+                        ["rate", "source ring", "wire", "to RX stamp", "RX delivery",
+                         "wire, no timestamps", "cost of measuring"]}, na_rep="-")
+      .hide(axis="index"),
+      "Table 9d - wire leg split, medians in ns, cross-host")
+""")
+
+md(r"""
+### And the bursts are not in the receiving kernel either
+
+The tail arrives in runs of consecutive messages. Taking the worst 0.01% of wire legs and
+asking how much of their excess over the median sits in RX delivery:
+
+| rate | wire excess during a spike | of which RX delivery | share | burst size |
+|---|---|---|---|---|
+| 200k | 2,117,687 | 761,636 | 36% | 206 messages |
+| 500k | 247,558 | 75,481 | 31% | 86 messages |
+| 1M | 3,793,591 | **−6,999** | **−0.2%** | 625 messages |
+
+At 200k and 500k about a third of a spike is the receiving kernel stalling — median delivery
+of 908 ns rising to 762 µs during an event, an 800-fold jump. At 1M the spikes are
+**entirely upstream**: RX delivery during a spike is *lower* than its own median, 11.9 µs
+against 18.9 µs. Which follows, once you consider what a spike is at that rate — a datagram
+held up before the receiver arrives at a receiver that is therefore idle, and is picked up
+at once.
+
+**Verdict: the AF_XDP receive path is not worth its privileged step.** At the rates this
+task centres on it could win about a microsecond of thirty-four. At 1M, where the receiving
+kernel does cost 12–19 µs once the measurement's own cost is subtracted, the events that
+dominate the far tail are upstream of it and would survive the change. What remains is in
+the one place software timestamps cannot reach — sender transmit, the two NICs, the fabric —
+and reaching it would need hardware timestamping, which was not attempted.
+
+Fan-out changes none of this. At ten destinations the source-ring wait grows from 292 ns to
+5,967 ns, which is the replication cost landing exactly where the send-mechanism work put
+it, while RX delivery stays at 971 ns and the wire leg is unchanged.
+""")
+
 # ---- figure 10: receive modes ----------------------------------------------
+md(r"""
+## 9e. Two attempts on the tail, and what repeating them cost
+
+Sections 9b–9d tried to *find* the tail by decomposing the path and ran out of road: the 32.8 µs
+between the sender's pre-send stamp and the receiving kernel's stamp cannot be split further
+without NIC hardware timestamps, which were not attempted here. So two changes tried to *avoid* the tail
+instead — and this section is mostly about what happened when they were measured a second time.
+
+- **path diversity** sends every datagram twice over **distinct source ports**, so the four-tuple
+  that equal-cost path selection hashes on differs. Two schedulings were built: `--dual-path`
+  submits both copies inline, and `--dup-path` gives redundancy its own sockets and writes to them
+  only when the source ring is empty, so a copy can never delay a real message. The receiver needs
+  no new code either way, because the monotonic gate already publishes whichever copy arrives first.
+- **split polling** runs the receiver as a polling thread and a publishing thread over an SPSC ring,
+  on the theory that a single-threaded loop stops busy-polling exactly when it falls behind.
+
+**Path diversity looks like a measured trade — 5.8× off p99.99 for 10% onto p50 — and neither half
+survives a second session.** The left panel is why. Three runs of the *identical* no-redundancy
+configuration produced p99.99 values of 81,133, 921,223 and 1,172,844 ns — a **14.5× spread between
+runs that differ in nothing at all**. Against that, a single baseline-versus-treatment pairing tells
+you which window you sampled, not which configuration is better. The p50 half fails for a related
+reason: per-rep spreads measure variation *inside* a window and cannot see the 8.8 µs of clock-offset
+drift *between* two configurations' windows.
+
+**What to look for:** the left panel shows the redundancy runs (n=6) all falling below the two
+worst baselines (n=3), which is the direction the mechanism predicts — two draws from the tail
+beating one. It is 13 of 18 pairwise comparisons and an exact one-sided Mann–Whitney p of 0.19, so
+it is suggestive and *not* established, and it would be a mistake to report it as more.
+
+The middle panel is the result that does hold, and it is measured on the receiver's own clock so no
+offset correction is possible or needed. Redundancy costs about 5–6 µs at p99, all of it inside the
+receiving kernel — and **it costs the same regardless of how the copy is submitted.** Four
+mechanisms span 237 ns, or 3.2%. The rightmost bar is the decisive one: AF_XDP transmits through
+`dev_direct_xmit`, sharing neither qdisc nor hardware transmit queue with the primary, and it is
+indistinguishable from pushing both copies back-to-back down a single socket. Transmit-side
+contention is not the mechanism, and no bypass on the send path can reach it.
+
+The right panel closes the last escape route. Doubling the datagram rate doubles the receiver's
+`recv` transitions, which is the one regime where io_uring's multishot receive should finally have a
+call to save. It is immune to the penalty — and irrelevant, because its absolute p99 is 1.98× worse
+than the kernel path's *with redundancy already on*. The penalty is masked by a larger constant
+cost, not removed.
+
+Split polling refutes itself for a simpler reason, in the table below: its handoff queue never held
+more than **4 datagrams of 8,192**, so the publisher never fell behind and the feedback loop the
+design exists to break was never running. Only its cost remains — the publish leg from 52 ns to
+505 ns.
+
+""")
+
+code(r"""
+btv = pd.read_csv(PLOTS / "baseline_tail_variance.csv")
+sm  = pd.read_csv(PLOTS / "redundancy_send_mechanism.csv")
+rb  = pd.read_csv(PLOTS / "redundancy_receive_backend.csv")
+
+fig, axes = plt.subplots(1, 3, figsize=(13.4, 4.3))
+
+# 1. Why no single pairing settles the far tail: the baseline itself is not reproducible.
+ax = axes[0]
+groups = [("no redundancy", btv[btv["redundancy"] == "off"]["e2e_p9999"], MUTED),
+          ("redundancy",    btv[btv["redundancy"] == "on"]["e2e_p9999"],  CAT[1])]
+for xi, (label, vals, colour) in enumerate(groups):
+    # Jitter is deterministic (evenly spaced by index), because a notebook that plots
+    # different dots on every run is not a record of anything.
+    v = list(vals)
+    offs = np.linspace(-0.16, 0.16, len(v)) if len(v) > 1 else [0.0]
+    ax.scatter([xi + o for o in offs], v, s=64, color=colour, zorder=3,
+               edgecolor=SURFACE, linewidth=1.0)
+    ax.hlines(np.median(v), xi - 0.28, xi + 0.28, color=INK2, linewidth=1.6, zorder=4)
+    ax.annotate(f"{max(v)/min(v):.1f}x spread", (xi, max(v)), textcoords="offset points",
+                xytext=(0, 9), ha="center", color=INK2, fontsize=8.5)
+ax.set_xticks([0, 1]); ax.set_xticklabels(["no redundancy\n(n=3)", "redundancy\n(n=6)"])
+ax.set_xlim(-0.5, 1.5)
+ax.set_yscale("log")
+ax.set_title("p99.99 across runs of identical configurations")
+style(ax, ylabel="end-to-end p99.99 (ns, log)")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+
+# 2. The cost that does replicate, and its indifference to the send mechanism.
+ax = axes[1]
+lab = {"none": "none", "dual-path": "UDP\ninline", "dup-leg-udp": "UDP\nown skt",
+       "dup-leg-iouring": "io_uring\nSQPOLL", "dup-leg-xdp": "AF_XDP\nown queue"}
+order = ["none", "dual-path", "dup-leg-udp", "dup-leg-iouring", "dup-leg-xdp"]
+xs, vals, cols = [], [], []
+for i, cfg in enumerate(order):
+    rows = sm[sm["config"] == cfg]
+    for j, (_, r) in enumerate(rows.iterrows()):
+        xs.append(i + (j - (len(rows) - 1) / 2) * 0.22)
+        vals.append(r["rx_delivery_p99"])
+        # AF_XDP is the one row that shares no queue with the primary: colour it apart.
+        cols.append(MUTED if cfg == "none" else (CAT[2] if cfg == "dup-leg-xdp" else CAT[1]))
+ax.bar(xs, vals, width=0.20, color=cols, zorder=3)
+# Two sessions measured some configurations, so bars come in pairs; stagger the value
+# labels vertically or the pairs overprint each other.
+for n, (x, v) in enumerate(zip(xs, vals)):
+    ax.annotate(f"{v:,.0f}", (x, v), textcoords="offset points",
+                xytext=(0, 4 + 11 * (n % 2)), ha="center", color=INK2, fontsize=7.5)
+ax.set_xticks(range(len(order))); ax.set_xticklabels([lab[c] for c in order], fontsize=8.5)
+ax.set_ylim(0, max(vals) * 1.34)
+ax.set_title("Receiving-kernel delivery p99 (one clock)")
+style(ax, ylabel="latency (ns)")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+
+# 3. The receive path: immune to the penalty, and twice as slow anyway.
+ax = axes[2]
+w, x = 0.34, np.arange(2)
+backends = ["kernel UDP + SO_BUSY_POLL", "io_uring multishot + provided buffers"]
+off = [rb[(rb.receive_backend == b) & (rb.redundancy == "off")]["e2e_p99"].iloc[0] for b in backends]
+on  = [rb[(rb.receive_backend == b) & (rb.redundancy == "on")]["e2e_p99"].iloc[0] for b in backends]
+ax.bar(x - w/2, off, width=w, color=MUTED, label="redundancy off", zorder=3)
+ax.bar(x + w/2, on,  width=w, color=CAT[1], label="redundancy on", zorder=3)
+for xi, a, b in zip(x, off, on):
+    ax.annotate(f"{b-a:+,.0f}", (xi + w/2, b), textcoords="offset points",
+                xytext=(0, 3), ha="center", color=INK2, fontsize=8.5, fontweight="600")
+ax.set_xticks(x); ax.set_xticklabels(["kernel UDP\nbusy-poll", "io_uring\nmultishot"], fontsize=8)
+ax.set_ylim(0, max(off + on) * 1.22)
+ax.set_title("End-to-end p99 by receive path")
+style(ax, ylabel="latency (ns)")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left")
+
+fig.tight_layout()
+plt.show()
+
+""")
+
+code(r"""
+rep = pd.read_csv(PLOTS / "redundancy_replication.csv")
+t = rep.copy()
+t.columns = ["percentile", "s1 base", "s1 dual", "s1 delta",
+             "s2 base", "s2 dual", "s2 delta", "replicates?"]
+table(t.style.format({c: "{:,.0f}" for c in t.columns
+                      if c not in ("percentile", "replicates?")}).hide(axis="index"),
+      "Table 9e - path diversity against its baseline, in ns, measured twice. The p50 and "
+      "p99.99 claims reverse sign between sessions and are withdrawn; the p99 cost is the "
+      "only column that replicates. Session 1's spreads were non-overlapping per-rep, which "
+      "is exactly the reassurance that does not survive between-window clock drift.")
+
+""")
+
+code(r"""
+sp = pd.read_csv(PLOTS / "split_poll.csv")
+t2 = sp[["config", "publish_p50", "rx_delivery_p50", "rx_delivery_p99",
+         "e2e_p50", "e2e_p99", "e2e_p999", "queue_high_water", "queue_slots"]].copy()
+t2.columns = ["config", "publish p50", "RX deliv p50", "RX deliv p99",
+              "e2e p50", "e2e p99", "e2e p99.9", "queue high-water", "queue slots"]
+table(t2.style.format({c: "{:,.0f}" for c in t2.columns if c != "config"},
+                      na_rep="-").hide(axis="index"),
+      "Table 9e - split polling, ns. The handoff queue never held more than 4 datagrams of "
+      "8,192, so the publisher never fell behind and the feedback loop this design targets "
+      "was not active. e2e p50 and p99 unchanged, publish leg 10x worse. Not shipped.")
+
+""")
+
 md(r"""
 ## 10. Receive mode, on a real NIC
 
@@ -793,14 +1460,15 @@ Kernel busy-poll lets the receiving thread pull packets off the device queue on 
 own core instead of waiting for a softirq. Whether that helps depends entirely on
 there being a device to poll.
 
-**What to look for:** on a real NIC busy-poll is decisively better — 34.5 µs against
-59.0 at the median, and 54.5 against 184.7 at p99.9. On loopback the same comparison
-runs the *other* way by a factor of 2.5, because there is no NAPI instance to poll
-and the blocking receive just adds a scheduler wake-up per message.
+**What to look for:** busy-poll is decisively better — 34.5 µs against 59.0 at the
+median, and 54.5 against 184.7 at p99.9. Both series are cross-host over the NIC.
 
-That is why the mode is selected from the bound address rather than exposed as a
-flag. Shipping both would mean shipping "these settings for a NIC, those for
-loopback" and expecting the operator to know which they have.
+The mode is still derived from the bound address rather than exposed as a flag, for a
+mechanical reason rather than a measured one: `SO_BUSY_POLL` is consulted by
+`sk_busy_loop()`, which needs a NAPI-backed device. With no such device there is nothing
+to poll, the blocking receive falls through to sleeping, and the option costs a wake-up
+per message instead of saving one. That is a property of the path, so the transport works
+it out rather than asking the operator to.
 """)
 
 code(r"""
@@ -821,8 +1489,7 @@ for i, (_, row) in enumerate(modes.iterrows()):
 ax.set_yscale("log")
 ax.set_xticks(x); ax.set_xticklabels(cols5)
 ax.set_ylim(top=ax.get_ylim()[1] * 4)
-ax.set_title("Receive mode over a real NIC, 200k msg/s\n"
-             "on loopback this comparison inverts")
+ax.set_title("Receive mode, cross-host over the NIC, 200k msg/s")
 style(ax, ylabel="latency (ns, log)", xlabel="percentile")
 ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
 ax.legend(loc="upper left", ncols=2)
@@ -908,16 +1575,165 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
+## 13. A routed long-haul path
+
+Every figure so far comes from a directly-attached path: one hop, ~35 µs one way. This section
+is a second host pair over a **routed inter-region path** at ~35 *milliseconds* one way -- three
+orders of magnitude longer, which inverts what is worth measuring. The relay's own cost, ~620 ns,
+is 0.002% of this path and cannot be seen at all. What can be seen is whether the design's
+*rules* survive a network permitted to reorder, drop and re-route.
+
+**What to look for:** the left panel is the result that matters. The delivery gate publishes only
+strictly increasing sequence ids, so a reordered datagram is *dropped*, not delivered late -- on a
+multi-path routed network that could have discarded a real fraction of the stream. It discarded
+**nothing**: zero reordered datagrams in 1,549,105 across three rates. The strictness that buys
+deduplication, late-drop and gap accounting in a single rule turns out to cost nothing here
+either. Path MTU is also exactly 1500 end to end, so nothing fragments.
+
+The middle panel is the cost of distance. Loss runs 20-80× the direct path's and climbs with
+offered rate, reaching 0.18% at 50k msg/s. Note the burst column in the table below: the 10k run
+lost 133 datagrams in a *single* event, and the 50k run averaged 20.6 consecutive. Loss here is
+outages, not independent drops.
+
+The right panel is the part that reads backwards until you know the mechanism: the **highest**
+rate has the lowest median and the tightest tail. Same effect as on the direct path and the same
+cause -- at 1,000 msg/s messages arrive a millisecond apart and every one meets a cold cache,
+while at 50,000 the receiver is warm and already spinning. The receiving kernel's delivery leg
+falls from 3,470 ns to 1,197 ns across the sweep.
+
+Two things this path settles that the short one could not. **Absolute one-way latency is finally
+trustworthy**: the inter-host clock offset measured 27,155 ns -- about 30× the short pair's, two
+regions rather than two racks -- but that is 0.08% of a 33.5 ms path, and the measured one-way
+sits within 0.3% of half the ICMP round trip. And **redundancy is decisively answered**: six
+interleaved blocks resolve it as a net *cost* — about 9% more frames never delivered, every block
+agreeing in sign (sign p = 0.031) — because the arm without redundancy dropped its ~1,920
+datagrams in one ~39 ms outage, and a copy sent microseconds later is inside that outage. No
+latency metric separates in either direction, which the table below shows and explains.
+
+""")
+
+code(r"""
+l3 = pd.read_csv(PLOTS / "l3_path.csv")
+l3 = l3.sort_values("rate")
+
+fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.2))
+x = np.arange(len(l3))
+
+# 1. The design question: does the monotonic gate throw anything away here?
+ax = axes[0]
+ax.bar(x - 0.2, l3["datagrams"], width=0.4, color=MUTED, label="datagrams delivered", zorder=3)
+# Reordered and suppressed are both exactly zero, which a log axis cannot draw -- so they are
+# stated rather than plotted, which is also the honest way to show a zero.
+ax.bar(x + 0.2, np.maximum(l3["reorder"], 0.6), width=0.4, color=CAT[2],
+       label="reordered (all zero)", zorder=3)
+for xi, (_, r) in zip(x, l3.iterrows()):
+    ax.annotate("0", (xi + 0.2, 0.7), textcoords="offset points", xytext=(0, 3),
+                ha="center", color=INK2, fontsize=9, fontweight="600")
+ax.set_yscale("log")
+ax.set_xticks(x); ax.set_xticklabels([rate_fmt(v) for v in l3["rate"]])
+ax.set_title("Gate: nothing reordered, nothing suppressed")
+style(ax, ylabel="datagrams (log)", xlabel="offered rate")
+ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(ns))
+ax.legend(loc="upper left")
+
+# 2. Loss against rate, with the burst length that makes redundancy useless.
+ax = axes[1]
+ax.plot(l3["rate"], l3["loss_frac"] * 100, color=CAT[1], marker="o", zorder=3)
+for _, r in l3.iterrows():
+    ax.annotate(f"burst {r['mean_burst']:.0f}", (r["rate"], r["loss_frac"] * 100),
+                textcoords="offset points", xytext=(0, 8), ha="center",
+                color=INK2, fontsize=8.5)
+ax.set_xscale("log"); ax.set_yscale("log")
+ax.set_title("First-copy loss rises with offered rate")
+style(ax, ylabel="loss (%, log)", xlabel="offered rate")
+ax.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(rate_fmt))
+
+# 3. Latency: distance dominates, and load helps.
+ax = axes[2]
+base = l3["wire_p50"] / 1e6
+ax.plot(l3["rate"], base, color=ORD4[3], marker="o", label="one-way p50 (ms)", zorder=3)
+ax2 = ax.twinx()
+ax2.plot(l3["rate"], (l3["wire_p999"] - l3["wire_p50"]) / 1e3, color=CAT[1],
+         marker="s", linestyle="--", label="p99.9 - p50 (us)", zorder=3)
+ax2.set_ylabel("jitter p99.9 - p50 (us)", color=INK2)
+ax2.spines["top"].set_visible(False)
+ax.set_xscale("log")
+ax.set_ylim(0, base.max() * 1.25)
+ax.set_title("Distance sets the median; load tightens the tail")
+style(ax, ylabel="one-way p50 (ms)", xlabel="offered rate")
+ax.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(rate_fmt))
+h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+ax.legend(h1 + h2, l1 + l2, loc="lower left")
+
+fig.tight_layout()
+plt.show()
+
+""")
+
+code(r"""
+t = l3[["rate", "datagrams", "reorder", "gate_suppressed", "loss_frac", "mean_burst",
+        "wire_p50", "wire_p999", "rx_delivery_p50", "shm_p50", "publish_p50"]].copy()
+t["loss_frac"] = t["loss_frac"] * 100
+t.columns = ["rate", "datagrams", "reordered", "suppressed", "loss %", "mean burst",
+             "one-way p50", "one-way p99.9", "RX deliv p50", "src-ring p50", "publish p50"]
+table(t.style.format({"rate": "{:,.0f}", "datagrams": "{:,.0f}", "loss %": "{:.4f}",
+                      "mean burst": "{:.1f}", "one-way p50": "{:,.0f}",
+                      "one-way p99.9": "{:,.0f}", "RX deliv p50": "{:,.0f}",
+                      "src-ring p50": "{:,.0f}", "publish p50": "{:,.0f}"}).hide(axis="index"),
+      "Table 13 - routed long-haul path, ns unless marked. Reordered and suppressed are zero "
+      "at every rate, which is the design question this pair existed to answer. Our own two "
+      "legs (src-ring, publish) are unchanged from the direct path -- they do not depend on "
+      "the network -- while the wire leg is a thousand times larger.")
+
+""")
+
+code(r"""
+ab = pd.read_csv(PLOTS / "l3_ab_paired.csv")
+LBL = {"loss_pct": "first-copy loss %", "undelivered": "frames never delivered",
+       "rx_delivery_p50": "RX delivery p50", "rx_delivery_p99": "RX delivery p99",
+       "wire_p50": "wire leg p50", "e2e_p50": "end-to-end p50", "e2e_p99": "end-to-end p99",
+       "e2e_p999": "end-to-end p99.9", "e2e_p9999": "end-to-end p99.99",
+       "shm_p50": "source-ring wait p50"}
+t2 = ab.copy()
+t2["metric"] = t2["metric"].map(lambda m: LBL.get(m, m))
+t2["clock"] = np.where(t2["cross_host"] == 1, "two clocks", "one clock")
+t2["verdict"] = np.where(t2["resolved"] == 1, "RESOLVED", "not resolved")
+t2 = t2[["metric", "clock", "median_diff", "lo", "hi", "null_spread", "n_blocks",
+         "sign_p", "verdict"]]
+t2.columns = ["metric", "clock", "on - off", "lo", "hi", "reference's own spread",
+              "blocks", "sign p", "verdict"]
+table(t2.style.format({"on - off": "{:+,.4g}", "lo": "{:+,.4g}", "hi": "{:+,.4g}",
+                       "reference's own spread": "{:,.4g}", "sign p": "{:.3f}"})
+      .hide(axis="index"),
+      "Table 13 - redundancy on the routed path across six interleaved counterbalanced blocks, "
+      "twelve of twelve arm-runs valid, arms two minutes apart within a block. The two RESOLVED "
+      "rows are the two needing no clock: loss and delivery are counters on the receiving host, "
+      "and both move the same way in all six blocks. Everything cross-host is unresolved because "
+      "the reference arm's own median moves 1.1 ms between blocks -- an effect smaller than that "
+      "column is not resolvable on this path however many blocks are run.")
+
+""")
+
+md(r"""
 ## Clock synchronisation
 
 Every cross-host figure is `recv_ts` on the receiving host minus `send_ts_ns` stamped
 on the sending host — two clocks — so it is worth stating what that does and does not
 affect.
 
-**What we rely on.** chrony keeps the hosts synchronised to well within 3
-microseconds; measured RMS offset during these runs was a few hundred nanoseconds on
-both. `chronyc tracking` is captured before *and* after each long run rather than
-once at the start.
+**What we rely on.** chrony keeps the directly-attached pair synchronised to well within
+3 microseconds; measured RMS offset during those runs was a few hundred nanoseconds on
+both. `chronyc tracking` is captured before *and* after each long run rather than once at
+the start, and an idle round-trip probe measures the offset directly.
+
+**The two paths sit in opposite regimes, and it matters.** On the short path the offset was
+separately measured wandering across 8.8 µs over an hour — the same size as the effects being
+looked for, which is why two apparent results did not survive repetition and why
+comparisons now run as interleaved blocks. On the routed long-haul path the offset is far
+larger in absolute terms, about 27 µs, but that is 0.08% of a 33.5 ms one-way, and the measured
+one-way sits within 0.3% of half the ICMP round trip. **Long haul is the one regime here where
+absolute one-way latency is trustworthy**, because the quantity finally dwarfs the uncertainty
+in the clocks.
 
 **A static offset is mostly harmless.** A constant offset shifts every sample
 equally, so it biases absolute medians but cancels exactly in anything comparative —
@@ -942,9 +1758,9 @@ independently measured end-to-end value (35,075 against 35,325 ns).
 microseconds, which bounds accuracy against absolute UTC — but the relevant quantity
 is the *relative* offset between hosts tracking the same sources, which is far
 smaller. Absolute one-way latencies carry a small systematic uncertainty; the
-comparative results do not. Tightening it would mean NIC hardware timestamping, PTP
-against the instance family's hardware clock, or a reflector design where one host
-stamps both departure and return.
+comparative results do not. Tightening it would mean NIC hardware timestamping, or a
+reflector design where one host stamps both departure and return. Neither was attempted:
+everything here rests on software timestamps and the hosts' existing time sync.
 
 ## Conclusions
 
@@ -980,77 +1796,93 @@ message rate from 1M to 2M *reduces* both packet rate and loss.
 
 - *Connected sockets over `sendmmsg`.* The structural argument favoured `sendmmsg`
   and was wrong on a real NIC.
-- *Busy-poll on a device, spin on loopback.* The same comparison inverts between the
-  two, by a factor of 2.5 in one direction and 1.7 in the other — so the transport
-  decides from the path rather than exposing a flag.
+- *Busy-poll where there is a device to poll.* `SO_BUSY_POLL` needs a NAPI-backed
+  device; without one it adds a wake-up per message rather than removing one. That is a
+  property of the path, so the transport derives it instead of exposing a flag.
 - *Duplication over retransmission or FEC.* Strictly monotonic delivery means a late
   repair cannot be inserted at all, so only redundancy that costs no latency is worth
   anything.
 - *Format work over tuning.* Shrinking messages 3.2x did more for headroom than any
   socket or core setting.
 
-## Next steps
+## What was done since, and what it cost
 
-Two independent lines of work, cost-ordered within each.
+Every avenue this work set out to try has now been attempted. The results are
+mostly negative, which is worth more than a list of intentions:
 
-### Reduce the latency
+- **io_uring — done, and it loses.** On the send side it produces no end-to-end difference that
+  survives session drift. On the receive side it is decisively worse (69% at the median), and
+  re-tested at twice the datagram rate — the one regime where a multishot receive should finally
+  have a system call to save — it was 1.98× worse in absolute p99. It appears immune to extra
+  load only because a larger constant cost masks it.
+- **AF_XDP — done for the send path, and it could not answer what it was chosen for.** This NIC
+  offers no zero-copy, so only copy mode is available, and copy mode keeps skb allocation and the
+  driver path — precisely the kernel involvement that needed ruling out. It did confirm the
+  send-cost model (37% off the send cycle, the largest of any mechanism) and is 4.6 µs *worse* end
+  to end, because the saving moves into the wire leg. AF_XDP receive was priced from the receive
+  timestamps at about a microsecond and judged not worth its privileged step.
+- **A routed long-haul path — done, and it settled the design's biggest open risk.** Section 13:
+  zero reordering in 1,549,105 datagrams, so the strictly-monotonic gate discards nothing even on
+  a multi-path network, and MTU 1500 holds end to end. Loss is 20-80× the short path's.
+- **Redundancy — measured on both paths, and it does not pay on either.** Loss arrives in bursts
+  far longer than the gap between a datagram and its copy: 69-80 consecutive datagrams on the
+  short path, and a single ~39 ms outage on the long one. Four-tuple diversity does not change
+  that, and its one reproducible effect is a **cost** of ~5-6 µs at p99 living entirely inside the
+  receiving kernel — invariant across four different send mechanisms, including AF_XDP on its own
+  transmit queue, which shares neither qdisc nor hardware queue with the primary.
+- **Two claims were withdrawn.** Path diversity appeared to buy 5.8× at p99.99 for 10% at the
+  median; repeating it reversed the sign of both, because the baseline's own p99.99 varies 14.5×
+  between identical runs and per-repetition spreads cannot see clock drift between windows.
+  Section 9e is the retraction.
+- **The measurement itself was audited.** Percentiles were being computed as the median of
+  per-file percentiles, which understated far tails by up to 719% and one maximum by 115×;
+  medians and p99s did not move. Comparisons now run as counterbalanced interleaved blocks with
+  a paired sign test, and six blocks is a hard floor — with all blocks agreeing the smallest
+  attainable two-sided p is 2/2ⁿ, so three blocks cannot reach significance at any effect size.
 
-The stage decomposition leaves **98% of the latency, and 100% of the large spikes, in the
-kernel network path**, with our own code at ~620 ns. Nothing above the kernel can move the
-median, so the task is to establish what the kernel contributes and then remove it.
+## Where to take it next
 
-1. **io_uring — cheapest, and worth doing first.** No privileges, no XDP program, no
-   interface binding; `liburing` is packaged and the change is confined to how the sender
-   and receiver issue I/O. Multishot receive with provided buffers takes the per-packet
-   syscall off the receive path, and `DEFER_TASKRUN` moves kernel task work to a controlled
-   point rather than an arbitrary one. **What it can and cannot answer:** it does not bypass
-   the kernel network stack, so it cannot rule out interference from that stack, and
-   removing a ~100 ns syscall cannot move a 34 µs wire leg. What it plausibly can do is
-   raise the burst drain rate — measured at about 1.3M msg/s — which would shorten the
-   events that dominate the far tail. A cheap test of a specific hypothesis rather than a
-   general speed-up.
-2. **AF_XDP — the experiment that actually tests kernel interference.** Bypasses the network
-   stack on a stock kernel, with no hugepages and no driver replacement. If the bursts
-   disappear the kernel was the cause; if they survive, the NIC or the fabric is. Binding an
-   XDP socket to a live NIC queue is disruptive, so this is gated on explicit confirmation
-   and a dedicated interface.
-3. **DPDK — the primary late-game solution.** If bypass proves to be the lever, this is
-   where the lowest and most predictable latency lives: a full userspace driver with no
-   per-packet kernel involvement. Materially more expensive to set up and to reproduce, so
-   it follows the AF_XDP result rather than preceding it.
-
-### Make the loss and fan-out stories real
-
-4. **Measure on an L3 path, and on one with a realistic loss pattern.** Everything the
-   design claims about loss is untestable at 2 × 10⁻⁵, and the independence premise behind
-   duplication is already known to be false here.
-5. **Stagger the redundant copy** by longer than a burst and see whether the rescue rate
-   moves off 0.4%. A small sender change needing nothing from the receiver — but only worth
-   doing where there is loss to rescue.
-6. **Multicast or a relay tree for fan-out.** The packet budget divides the achievable
-   message rate by receiver count, so unicast replication cannot reach 50 receivers at any
-   interesting rate. This is the only item here that changes an asymptote rather than a
-   constant.
+1. **The 32.8 µs opaque leg.** Between the sender's pre-send stamp and the receiving kernel's
+   stamp sit sender transmit, both NICs and the fabric. Both *software* routes in are exhausted:
+   AF_XDP copy mode keeps the driver path, and the software transmit stamp reflects completion
+   rather than transmit. Splitting it further needs NIC hardware timestamps, which this work did
+   not attempt — the one open item whose next step is a different technique rather than more
+   analysis of data already collected.
+2. **Loss at the 1-10% the task contemplates.** Neither path gets near it — 2.2e-05 on the short
+   path, up to 1.8e-03 on the routed one. That regime has to be *induced* rather than found.
+3. **A temporal stagger for the redundant copy**, held back by longer than a burst. The receiver
+   needs no change, because the gate already absorbs a late copy. It trades latency for
+   completeness, which is a policy choice worth exposing rather than deciding.
+4. **The receive-side cost of redundancy** — ~5-6 µs at p99, entirely inside the receiving
+   kernel and identical across four submission mechanisms, so it is the cost of taking delivery of
+   twice the datagrams rather than of how they are sent. Two routes: a second receive socket on its
+   own core, and an XDP program running the monotonic gate so the losing copy is dropped before
+   skb allocation. The second is an operator action.
+5. **Multicast or a relay tree for fan-out.** The packet budget divides achievable message rate by
+   receiver count, so unicast replication cannot reach fifty receivers at any interesting rate.
+   The only item here that changes an asymptote rather than a constant.
 
 **Honest limitations.**
 
-- p99.999 rests on ~200 observations per run and varies by a factor of two between
-  repetitions. It is reported, but the drain event dominates it and it should not be
-  read as a property of the transport.
-- Fan-out is measured to 3 independent receivers and extrapolated, not measured, at
-  the 50 the task contemplates. Skew grows linearly, which implies roughly 150 µs of
-  replication cost at 50 receivers — serial unicast is the wrong mechanism at that
-  scale, and multicast or a relay tree would be needed.
-- The receivers in the fan-out sweep share one host, so one NIC carries N copies.
-- The ~2 ms drain events are unattributed beyond "the wire". Distinguishing sender
-  kernel TX from NIC from receiver kernel RX needs NIC hardware timestamps, which we
-  do not collect.
-- One host is virtualised and one bare metal. We tested specifically for
-  hypervisor-induced periodicity with simultaneous opposite-direction streams over 15
-  minutes and found none (autocorrelation at 300 s lag: −0.02 and −0.09).
-- Loss resilience is verified functionally — duplication rescues, the gate suppresses
-  duplicates and stragglers exactly — but not under deliberately injected loss, so
-  the p → p² claim is reasoned rather than measured.
+- p99.999 rests on ~200 observations per run and varies by a factor of two between repetitions.
+  It is reported, but the drain event dominates it and it is not a property of the transport.
+- Fan-out is measured to 10 independent receivers, and they share one host, so one NIC carries N
+  copies where N hosts would each carry one. These figures are an upper bound on the design's
+  cost rather than a prediction for N machines.
+- **The SQPOLL drop burst was seen once and not repeated** — two of ten receivers lost about
+  1,123 datagrams each in one of three repetitions. Not called a defect without repeat runs; not
+  recommended meanwhile.
+- The receiving kernel is split out and priced (908 ns of 33.7 µs at 200k; 12-19 µs of 65 µs at
+  1M), which is what made the AF_XDP receive decision possible. The rest of the wire leg is not.
+- The ~2 ms drain events are attributed only as far as "upstream of the receiving kernel". At 1M
+  they are entirely upstream; at 200k and 500k about a third of the excess is the receiving kernel.
+- One host is virtualised and one bare metal. We tested specifically for hypervisor-induced
+  periodicity with simultaneous opposite-direction streams over 15 minutes and found none
+  (autocorrelation at 300 s lag: −0.02 and −0.09).
+- Rates above 50k msg/s on the routed path, and fan-out beyond one receiver there, were
+  deliberately not attempted: loss was already climbing with offered rate on a shared long-haul
+  link.
+
 """)
 
 nb["cells"] = C

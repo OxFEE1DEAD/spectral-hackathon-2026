@@ -32,14 +32,19 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <linux/errqueue.h>
+#include <linux/net_tstamp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include "util.h"
 
 namespace udp {
 
@@ -71,18 +76,42 @@ inline bool parse_method(const std::string& s, SendMethod* out) {
 struct Options {
   int sndbuf = 8 << 20;
   int rcvbuf = 8 << 20;
+  // Ask the kernel to stamp each datagram just before it hands it to the driver, so the
+  // sending kernel's protocol path can be split off the opaque wire leg. Like the receive
+  // stamp, the interval it yields is two readings of one clock on one host, so it is exact
+  // and needs no cross-host synchronisation. Measurement-only.
+  bool tx_timestamp = false;
+  // Ask the kernel to stamp each datagram as it enters the receive path, so the wire leg
+  // can be split at the receiver's own kernel boundary. Measurement-only: it turns the
+  // hot-path recv() into a recvmsg() with a control buffer to parse, which is exactly the
+  // sort of thing that should not be on by default in the configuration being measured.
+  bool rx_timestamp = false;
   // SO_BUSY_POLL microseconds, or kBusyPollAuto to choose automatically.
   int busy_poll_us = kBusyPollAuto;
+  // Source address for the sending sockets. Empty means "let the route decide", which is
+  // right on a directly-attached L2 path and wrong on anything selected by policy routing.
+  //
+  // On an L3 path the outgoing interface can be chosen by *source address* rather than by
+  // destination: the host carries one routing table per uplink and an `ip rule` per local
+  // address that selects it. A socket that does not bind its source therefore leaves by
+  // whichever uplink the main table points at -- which is the default route, i.e. the
+  // management interface, not the link under test. Measured on such a pair: bound to the
+  // interface the peer was unreachable, bound to the source address the same peer answered
+  // in 69.7 ms over the intended uplink.
+  //
+  // Port is left at zero so each socket still gets its own ephemeral source port, which is
+  // what keeps the four-tuple diversity of the redundant leg intact.
+  std::string src_addr;
 };
 
 // Busy-polling is worth it only when there is a NAPI-backed device to poll.
 //
 // On a real NIC it lets the receiving thread pull packets off the device queue on
-// its own core instead of waiting for a softirq, which measurably tightens the
-// tail. On loopback there is no NAPI instance at all: sk_busy_loop() finds nothing
-// to poll, the blocking recv() falls through to sleeping, and we pay a scheduler
-// wake-up on every message -- measured at 2.5x the median and 34x the p99.99
-// versus a plain non-blocking spin.
+// its own core instead of waiting for a softirq, which measured 1.7x better at the
+// median and 3.4x at p99.9 cross-host. Bound to an address with no NAPI-backed
+// device, sk_busy_loop() finds nothing to poll: the blocking recv() falls through to
+// sleeping and we pay a scheduler wake-up per message instead of avoiding one, so the
+// same option becomes a cost rather than a saving.
 //
 // So the transport picks per bound address rather than exposing a knob. Offering
 // the operator two modes would mean shipping "these settings for the median, those
@@ -134,6 +163,25 @@ inline std::string describe(const sockaddr_in& a) {
 }
 
 inline void apply_common(int fd, const Options& o, bool sending) {
+  // Bind the source before anything else: on a policy-routed host this is what decides
+  // which uplink the datagrams leave by, and connect() latches the route.
+  //
+  // Applied here rather than in each backend's open() because the kernel-UDP and io_uring
+  // senders both come through this function, so they cannot disagree about it.
+  if (sending && !o.src_addr.empty()) {
+    sockaddr_in src{};
+    src.sin_family = AF_INET;
+    src.sin_port = 0;  // ephemeral, so distinct sockets keep distinct four-tuples
+    if (inet_pton(AF_INET, o.src_addr.c_str(), &src.sin_addr) != 1) {
+      fprintf(stderr, "source address %s is not a valid IPv4 literal\n",
+              o.src_addr.c_str());
+    } else if (bind(fd, reinterpret_cast<sockaddr*>(&src), sizeof(src)) != 0) {
+      // Loud rather than ignored: silently sending from the wrong address means measuring
+      // a different network path than the one named on the command line.
+      fprintf(stderr, "bind to source %s failed: %s\n", o.src_addr.c_str(),
+              std::strerror(errno));
+    }
+  }
   const int buf = sending ? o.sndbuf : o.rcvbuf;
   const int name = sending ? SO_SNDBUF : SO_RCVBUF;
   if (setsockopt(fd, SOL_SOCKET, name, &buf, sizeof(buf)) != 0) {
@@ -221,6 +269,104 @@ class Sender {
   size_t peer_count() const { return addrs_.size(); }
   const std::vector<sockaddr_in>& peers() const { return addrs_; }
   SendMethod method() const { return method_; }
+  // Named the same as the io_uring backend's accessor so the relay loop can be written
+  // once against either.
+  const char* method_name() const { return udp::method_name(method_); }
+  // No asynchronous completions on this path, so nothing can fail after the fact.
+  uint64_t completion_errors() const { return 0; }
+
+  // ---- transmit timestamping, measurement only ----------------------------------
+  //
+  // The kernel reports a transmit timestamp on the socket's error queue rather than
+  // inline, so this is a three-part dance: enable it, remember when we handed each
+  // datagram over, and later collect the stamps and difference them. What comes out is
+  // the cost of the kernel's own transmit path -- protocol headers, route, qdisc -- up to
+  // the point the driver takes the frame.
+  //
+  // SOF_TIMESTAMPING_OPT_ID makes the kernel label each datagram with a counter that
+  // starts at zero when the option is enabled, so the label is exactly the index of our
+  // send. OPT_TSONLY keeps the error-queue message down to the timestamp instead of
+  // echoing the payload back at us.
+  bool enable_tx_timestamps() {
+    const int flags = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE |
+                      SOF_TIMESTAMPING_OPT_ID | SOF_TIMESTAMPING_OPT_TSONLY;
+    if (fds_.empty()) return false;
+    if (setsockopt(fds_[0], SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) != 0) {
+      fprintf(stderr, "warning: SO_TIMESTAMPING(TX) not applied: %s\n",
+              std::strerror(errno));
+      return false;
+    }
+    presend_.assign(kTxIdRing, 0);
+    tx_samples_.reserve(1u << 21);
+    tx_timestamp_ = true;
+    return true;
+  }
+
+  bool tx_timestamp() const { return tx_timestamp_; }
+
+  // Remember when this datagram was handed to the kernel. Called once per send_all, so
+  // the id the kernel will report matches the counter kept here.
+  void note_send(uint64_t presend_ns) {
+    if (!tx_timestamp_) return;
+    presend_[tx_next_id_ & (kTxIdRing - 1)] = presend_ns;
+    ++tx_next_id_;
+  }
+
+  // Collect whatever the kernel has posted. Called from the relay's idle branch, so it
+  // never delays a real message -- the same rule the redundancy path follows.
+  void drain_tx_stamps() {
+    if (!tx_timestamp_) return;
+    alignas(8) char control[512];
+    for (int budget = 0; budget < 64; ++budget) {
+      msghdr msg{};
+      msg.msg_control = control;
+      msg.msg_controllen = sizeof(control);
+      const ssize_t n = ::recvmsg(fds_[0], &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+      if (n < 0) return;
+      uint64_t stamp = 0;
+      uint32_t id = 0;
+      bool have_stamp = false, have_id = false;
+      for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_TIMESTAMPING) {
+          timespec ts[3];
+          std::memcpy(ts, CMSG_DATA(c), sizeof(ts));
+          stamp = static_cast<uint64_t>(ts[0].tv_sec) * 1000000000ull +
+                  static_cast<uint64_t>(ts[0].tv_nsec);
+          have_stamp = stamp != 0;
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR) {
+          sock_extended_err ee;
+          std::memcpy(&ee, CMSG_DATA(c), sizeof(ee));
+          if (ee.ee_origin == SO_EE_ORIGIN_TIMESTAMPING) {
+            id = ee.ee_data;
+            have_id = true;
+          }
+        }
+      }
+      if (!have_stamp || !have_id) {
+        ++tx_unmatched_;
+        continue;
+      }
+      // The ring only holds the most recent kTxIdRing sends; anything older than that
+      // has been overwritten and is counted rather than guessed at.
+      if (tx_next_id_ - id > kTxIdRing) {
+        ++tx_expired_;
+        continue;
+      }
+      const uint64_t sent = presend_[id & (kTxIdRing - 1)];
+      if (sent == 0 || stamp <= sent) {
+        ++tx_unmatched_;
+        continue;
+      }
+      if (tx_samples_.size() < tx_samples_.capacity()) {
+        tx_samples_.push_back(static_cast<uint32_t>(
+            std::min<uint64_t>(stamp - sent, 0xffffffffull)));
+      }
+    }
+  }
+
+  const std::vector<uint32_t>& tx_stack_samples() const { return tx_samples_; }
+  uint64_t tx_unmatched() const { return tx_unmatched_; }
+  uint64_t tx_expired() const { return tx_expired_; }
 
   // Send one datagram to every peer. Returns how many peers it reached, so partial
   // fan-out is accounted for rather than silently lost.
@@ -259,7 +405,16 @@ class Sender {
   }
 
  private:
+  // Power of two: the id the kernel reports is masked into this ring.
+  static constexpr uint32_t kTxIdRing = 1u << 16;
+
   SendMethod method_ = SendMethod::kConnected;
+  bool tx_timestamp_ = false;
+  uint32_t tx_next_id_ = 0;
+  std::vector<uint64_t> presend_;
+  std::vector<uint32_t> tx_samples_;
+  uint64_t tx_unmatched_ = 0;
+  uint64_t tx_expired_ = 0;
   std::vector<int> fds_;
   std::vector<sockaddr_in> addrs_;
   std::vector<iovec> iov_;
@@ -316,6 +471,19 @@ class Receiver {
       setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
+    rx_timestamp_ = opts.rx_timestamp;
+    if (rx_timestamp_) {
+      // RX_SOFTWARE is the stamp taken as the packet enters the receive path; SOFTWARE
+      // is what asks for it to be reported. Software flags only -- hardware timestamping is
+      // deliberately not requested here, because asking for it would only invite a
+      // silently empty slot.
+      const int flags = SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+      if (setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) != 0) {
+        fprintf(stderr, "warning: SO_TIMESTAMPING not applied: %s\n",
+                std::strerror(errno));
+        rx_timestamp_ = false;
+      }
+    }
     if (bind(fd_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
       fprintf(stderr, "bind %s failed: %s\n", describe(local).c_str(),
               std::strerror(errno));
@@ -342,11 +510,73 @@ class Receiver {
     return n < 0 ? -1 : static_cast<int>(n);
   }
 
+  // Nanoseconds between the kernel stamping this datagram on entry to its receive path
+  // and borrow() returning it to us. Valid only when Options::rx_timestamp was set and
+  // the kernel actually attached a stamp; zero otherwise.
+  uint64_t rx_delivery_ns() const { return rx_delivery_ns_; }
+  uint64_t missing_rx_stamps() const { return missing_rx_stamps_; }
+
+  // Borrow/release, matching the io_uring backend so one relay loop serves both.
+  // Here the datagram is read into a buffer this object owns, which is the same
+  // single copy the kernel would make into any caller-supplied buffer; the io_uring
+  // side hands back kernel-filled memory directly. release() has nothing to do.
+  //
+  // Sized for jumbo frames so a sender configured for a larger datagram is truncated
+  // visibly at the parser rather than silently misparsed.
+  int borrow(const uint8_t** data) {
+    if (buf_.empty()) buf_.resize(65536);
+    const int n = rx_timestamp_ ? recv_stamped(buf_.data(),
+                                              static_cast<uint32_t>(buf_.size()))
+                                : recv(buf_.data(), static_cast<uint32_t>(buf_.size()));
+    if (n >= 0) *data = buf_.data();
+    return n;
+  }
+
+  // recvmsg() variant that also collects the kernel's receive timestamp. Kept separate
+  // from recv() so the untimestamped path stays exactly as it was measured.
+  int recv_stamped(void* buf, uint32_t cap) {
+    iovec iov{buf, cap};
+    alignas(8) char control[256];
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    const ssize_t n = ::recvmsg(fd_, &msg, blocking_ ? 0 : MSG_DONTWAIT);
+    if (n < 0) return -1;
+    // Read the clock only after the data is in hand, so the interval measured is
+    // "kernel stamped it" to "we have it", with nothing of ours in between.
+    const uint64_t now = util::now_ns();
+    rx_delivery_ns_ = 0;
+    for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+      if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SO_TIMESTAMPING) continue;
+      // Three slots: software, deprecated hardware, raw hardware. Only software stamps are
+      // requested, so only the software slot is ever populated.
+      timespec ts[3];
+      std::memcpy(ts, CMSG_DATA(c), sizeof(ts));
+      const uint64_t stamp = static_cast<uint64_t>(ts[0].tv_sec) * 1000000000ull +
+                             static_cast<uint64_t>(ts[0].tv_nsec);
+      if (stamp != 0 && now > stamp) rx_delivery_ns_ = now - stamp;
+      break;
+    }
+    if (rx_delivery_ns_ == 0) ++missing_rx_stamps_;
+    return static_cast<int>(n);
+  }
+
+  void release() {}
+
+  const char* mode_name() const { return busy_poll_us_ > 0 ? "busy-poll" : "spin"; }
+  bool rx_timestamp() const { return rx_timestamp_; }
+
  private:
   int fd_ = -1;
   bool blocking_ = false;
   int busy_poll_us_ = 0;
   sockaddr_in bound_{};
+  std::vector<uint8_t> buf_;
+  bool rx_timestamp_ = false;
+  uint64_t rx_delivery_ns_ = 0;
+  uint64_t missing_rx_stamps_ = 0;
 };
 
 }  // namespace udp

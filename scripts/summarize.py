@@ -8,10 +8,22 @@ Two things this does that a single run cannot:
   fault per 4 KB page for a whole lap. Those faults are startup cost, not transport
   latency, and they land squarely in the tail.
 
-* Reports each percentile as a median across repetitions, with the observed spread.
-  One run cannot establish a p99.9 and certainly not a p99.99 -- a single stall
-  moves it by orders of magnitude. If the spread across repetitions is wide, the
-  number is not yet a measurement, and printing it next to the median says so.
+* Pools samples before taking a percentile, rather than taking the median of
+  per-file percentiles. This matters far more than it sounds: on real runs the two
+  disagree by up to 719% at p99.99, because the median across files discards
+  precisely the files that contain the rare events -- which is where a p99.99
+  lives. Measured on four ten-consumer runs, median-of-per-file understated the
+  p99.99 by 1.4x, 3.4x, 8.2x and 1.7x. Pooling uses every sample that was
+  collected, which is the whole reason for collecting them.
+
+* Reports a spread, and is explicit that it is a *within-session* spread. It is
+  the range of per-repetition pooled values, so it captures variation between
+  repetitions of one run in one window. It does NOT capture the drift of the two
+  hosts' clocks between windows, nor the environment's own between-window mood --
+  three runs of an identical configuration have produced p99.99 values spanning
+  14.5x. Quoting this column as the uncertainty of a comparison is what caused two
+  published results to be withdrawn. For comparisons between configurations use
+  ab_bench.sh and paired_stats.py, which measure across blocks instead.
 
 Usage:
     summarize.py [--drop N] [--json] DIR [DIR ...]
@@ -61,43 +73,66 @@ def summarize_dir(directory, drop):
     if not files:
         return None
 
-    # Percentiles are computed per (repetition, consumer) and then aggregated, so a
-    # slow consumer or a bad repetition is visible rather than averaged away.
-    per_run = []
+    # Samples are kept per repetition and pooled, not reduced to a percentile per file.
+    # A percentile of a pool of N*M samples is an estimate from N*M samples; the median of
+    # N per-file percentiles is not, and at p99.99 it is wrong by multiples.
+    by_rep = {}
+    skipped = []
     for path in files:
         match = REP_RE.search(path.name)
         if not match:
             continue
         samples = load(path, drop)
         if samples is None:
-            print(f"  skipping {path.name}: fewer than {drop} samples", file=sys.stderr)
+            skipped.append(path.name)
             continue
-        samples.sort()
-        per_run.append(
-            {
-                "rep": int(match.group(1)),
-                "consumer": int(match.group(2)),
-                "n": len(samples),
-                "min": samples[0],
-                "max": samples[-1],
-                **{f"p{p:g}": pct(samples, p) for p in PERCENTILES},
-            }
-        )
-    if not per_run:
+        by_rep.setdefault(int(match.group(1)), []).extend(samples)
+    if skipped:
+        # Loud, and counted: a repetition that vanished is a fact about the measurement,
+        # not a detail. Printing it and carrying on is how a comparison comes to rest on a
+        # single surviving repetition whose spread therefore reads as zero.
+        print(f"  WARNING: {len(skipped)} file(s) had fewer than {drop} samples and were "
+              f"excluded: {', '.join(skipped)}", file=sys.stderr)
+    if not by_rep:
         return None
 
-    agg = {"name": Path(directory).name, "runs": len(per_run),
-           "reps": len({r["rep"] for r in per_run}),
-           "consumers": len({r["consumer"] for r in per_run}),
-           "samples_per_run": min(r["n"] for r in per_run)}
+    # Per-repetition pooled percentiles give the within-session spread; everything pooled
+    # gives the headline estimate.
+    per_rep = {}
+    for rep, vals in by_rep.items():
+        vals.sort()
+        per_rep[rep] = {"n": len(vals), "min": vals[0], "max": vals[-1],
+                        **{f"p{p:g}": pct(vals, p) for p in PERCENTILES}}
+
+    pooled = sorted(v for vals in by_rep.values() for v in vals)
+
+    n_consumers = len({int(REP_RE.search(p.name).group(2))
+                       for p in files if REP_RE.search(p.name)})
+    agg = {"name": Path(directory).name,
+           "runs": len(files) - len(skipped),
+           "reps": len(by_rep),
+           "consumers": n_consumers,
+           "excluded_files": len(skipped),
+           "samples_per_run": min(r["n"] for r in per_rep.values()),
+           "samples_pooled": len(pooled)}
     for key in ["min"] + [f"p{p:g}" for p in PERCENTILES] + ["max"]:
-        vals = [r[key] for r in per_run]
+        if key == "min":
+            headline = pooled[0]
+        elif key == "max":
+            headline = pooled[-1]
+        else:
+            headline = pct(pooled, float(key[1:]))
+        vals = [r[key] for r in per_rep.values()]
         agg[key] = {
-            "median": int(statistics.median(vals)),
-            "lo": min(vals),
+            "median": int(headline),          # pooled estimate, not a median of medians
+            "lo": min(vals),                  # within-session spread across repetitions
             "hi": max(vals),
         }
-    agg["_per_run"] = per_run
+    # A percentile needs roughly 10/(1-p) samples to mean anything; below that it is the
+    # single worst observation wearing a percentile's name.
+    agg["_resolvable"] = {f"p{p:g}": len(pooled) >= 10.0 / (1.0 - p / 100.0)
+                          for p in PERCENTILES}
+    agg["_per_rep"] = per_rep
     return agg
 
 
@@ -119,7 +154,7 @@ def main():
 
     if args.json:
         for r in results:
-            r.pop("_per_run", None)
+            r.pop("_per_rep", None)
         print(json.dumps(results, indent=2))
         return
 
@@ -133,14 +168,29 @@ def main():
     for r in results:
         row = f"{r['name']:<22}{r['reps']:>5}{r['consumers']:>5}"
         for key in ["min", "p50", "p99", "p99.9", "p99.99", "max"]:
-            row += f"{r[key]['median']:>12,}"
+            # A percentile the sample count cannot support is bracketed rather than
+            # printed as though it were measured.
+            v = f"{r[key]['median']:,}"
+            if key.startswith("p") and not r["_resolvable"].get(key, True):
+                v = f"({v})"
+            row += f"{v:>12}"
         print(row)
-        # The spread across repetitions is the honesty column: a p99.99 whose
-        # median and extremes differ by an order of magnitude is not established.
-        spread = f"{'  spread lo..hi':<22}{'':>5}{'':>5}"
+        # Explicitly labelled: this is variation between repetitions inside one session.
+        # It is not the uncertainty of a comparison against another configuration.
+        spread = f"{'  within-session':<22}{'':>5}{'':>5}"
         for key in ["min", "p50", "p99", "p99.9", "p99.99", "max"]:
             spread += f"{r[key]['lo']:>5,}..{r[key]['hi']:<6,}"
         print(spread)
+        if r["reps"] < 2:
+            print(f"{'  ':<22}only {r['reps']} repetition: the spread above is not an "
+                  f"uncertainty, it is one number repeated")
+        if r["excluded_files"]:
+            print(f"{'  ':<22}{r['excluded_files']} file(s) excluded as too short "
+                  f"-- see warning above")
+        unresolvable = [k for k, ok in r["_resolvable"].items() if not ok]
+        if unresolvable:
+            print(f"{'  ':<22}{r['samples_pooled']:,} samples pooled: "
+                  f"{', '.join(unresolvable)} shown in parentheses, not supported")
 
 
 if __name__ == "__main__":

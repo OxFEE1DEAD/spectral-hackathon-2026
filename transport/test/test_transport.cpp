@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "delivery.h"
+#include "iou_backend.h"
 #include "wire.h"
 
 namespace {
@@ -309,6 +310,68 @@ void test_duplicate_flag_roundtrip() {
   printf("test_duplicate_flag_roundtrip OK\n");
 }
 
+// ---- io_uring backend -----------------------------------------------------
+//
+// The ABI declared in iou_abi.h is checked at compile time by static_asserts on every
+// structure size and field offset, so including the header already covers that. What a
+// test has to cover is the part those cannot reach: that the ring is driven correctly.
+// A round trip over loopback exercises submission, completion reaping, the multishot
+// receive, and buffer recycling in one go.
+//
+// Skipped rather than failed where io_uring is unavailable -- the kernel may have it
+// disabled, and a build machine is not necessarily the measurement machine.
+void test_iouring_roundtrip() {
+  iou::Options ropts;
+  ropts.poll = iou::PollMode::kPolled;  // loopback: no NAPI instance to poll
+  ropts.recv_buffers = 256;
+  iou::Receiver rx;
+  if (!rx.open("127.0.0.1", 53999, ropts)) {
+    printf("test_iouring_roundtrip SKIPPED (io_uring unavailable)\n");
+    return;
+  }
+  iou::Sender tx;
+  if (!tx.open({"127.0.0.1:53999"}, 53999, iou::Options{})) {
+    printf("test_iouring_roundtrip SKIPPED (io_uring send unavailable)\n");
+    return;
+  }
+
+  // More datagrams than the buffer pool holds, so recycling has to work rather than
+  // the pool merely being large enough to hide a leak.
+  const int kCount = 2000;
+  uint8_t out[512];
+  int received = 0;
+  for (int i = 0; i < kCount; ++i) {
+    const uint32_t len = 64 + (i % 400);
+    std::memset(out, static_cast<uint8_t>(i), len);
+    assert(tx.send_all(out, len) == 1);
+    for (;;) {
+      const uint8_t* got = nullptr;
+      const int n = rx.borrow(&got);
+      if (n < 0) break;
+      assert(n >= 64 && n <= 464);
+      assert(got[0] == static_cast<uint8_t>(received));
+      ++received;
+      rx.release();
+    }
+  }
+  // Loopback does not reorder or drop, so everything sent must arrive.
+  for (int spin = 0; spin < 1000000 && received < kCount; ++spin) {
+    const uint8_t* got = nullptr;
+    const int n = rx.borrow(&got);
+    if (n < 0) continue;
+    assert(got[0] == static_cast<uint8_t>(received));
+    ++received;
+    rx.release();
+  }
+  assert(received == kCount);
+  assert(tx.completion_errors() == 0);
+  // One arm at startup and no more: the multishot receive should never have stopped.
+  assert(rx.rearms() == 1);
+  assert(rx.no_buffer_events() == 0);
+  printf("test_iouring_roundtrip OK (%d datagrams, pool of %u)\n", received,
+         ropts.recv_buffers);
+}
+
 }  // namespace
 
 int main() {
@@ -325,6 +388,7 @@ int main() {
   test_gate_drops_straggler_that_arrives_too_late();
   test_gate_rejects_reordering();
   test_gate_first_frame_defines_origin();
+  test_iouring_roundtrip();
   printf("ALL TESTS PASSED\n");
   return 0;
 }

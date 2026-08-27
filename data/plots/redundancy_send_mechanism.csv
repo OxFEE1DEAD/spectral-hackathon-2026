@@ -1,0 +1,8 @@
+session,config,copy_carried_by,shares_qdisc_with_primary,rx_delivery_p50,rx_delivery_p99,rx_delivery_p999,e2e_p50,e2e_p99,e2e_p999,e2e_p9999
+2,none,none,,905,1518,5305,34470,39597,51837,81133
+2,dual-path,kernel UDP on the primary sockets,yes,949,7437,11696,33287,44092,63581,259100
+2,dup-leg-udp,kernel UDP on its own sockets,yes,946,7537,12810,34219,44222,58353,368922
+2,dup-leg-iouring,io_uring + SQPOLL on its own ring,yes,957,7638,12912,38821,49608,67959,98174
+3,none,none,,913,2041,10466,34190,40743,110475,1172844
+3,dup-leg-udp,kernel UDP on its own sockets,yes,947,7438,11631,35792,45375,54436,74961
+3,dup-leg-xdp,AF_XDP on its own transmit queue,no,944,7401,11593,32275,41837,51416,94231

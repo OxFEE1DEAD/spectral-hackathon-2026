@@ -37,6 +37,12 @@ out_shm=/fanout_out
 out_dir="$root/data"
 tag=""
 busy_poll=0
+# Which mechanism carries datagrams: kernel UDP sockets driven by send()/recv(), or the
+# same sockets driven through an io_uring submission ring. Applies to both ends.
+backend=udp
+sqpoll=0
+sq_core=""
+iou_poll=auto
 
 die() { echo "error: $*" >&2; exit 2; }
 
@@ -61,12 +67,21 @@ while [[ $# -gt 0 ]]; do
     --out-dir) out_dir="$2"; shift 2 ;;
     --tag) tag="$2"; shift 2 ;;
     --busy-poll) busy_poll="$2"; shift 2 ;;
+    --backend) backend="$2"; shift 2 ;;
+    --sqpoll) sqpoll=1; shift ;;
+    --sq-core) sq_core="$2"; shift 2 ;;
+    --iou-poll) iou_poll="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$role" =~ ^(all|send|recv)$ ]] || die "--role must be all, send or recv"
+[[ "$backend" =~ ^(udp|iouring)$ ]] || die "--backend must be udp or iouring"
+[[ "$iou_poll" =~ ^(auto|napi|polled)$ ]] || die "--iou-poll must be auto, napi or polled"
+if [[ "$backend" == udp && ( "$sqpoll" == 1 || -n "$sq_core" ) ]]; then
+  die "--sqpoll/--sq-core require --backend iouring"
+fi
 if [[ "$role" != recv && ${#peers[@]} -eq 0 ]]; then
   if [[ "$role" == all ]]; then peers=(127.0.0.1); else die "--peer is required"; fi
 fi
@@ -75,11 +90,9 @@ mkdir -p "$out_dir"
 label="${tag:-r${rate}}"
 lat_csv="$out_dir/latency_${label}.csv"
 
-# The consumer writes one CSV line per message from inside its measurement loop.
-# On a disk-backed filesystem the periodic buffer flush blocks in write(), which
-# lands as a ~1 ms spike at p99.99 -- two orders of magnitude above the tail of
-# the transport being measured, and invisible below p99.9. So the samples are
-# staged on tmpfs and moved into place once the run is over.
+# The consumer records samples into preallocated memory and dumps them once, after
+# the run, so nothing on the measurement path ever calls write(). Staging that single
+# dump on tmpfs as well costs nothing and keeps even the final flush off the disk.
 lat_stage="/dev/shm/latency_${label}.$$.csv"
 
 # A stale segment from a killed run would be read as live data.
@@ -104,7 +117,9 @@ start_receiver_side() {
   taskset -c "$receiver_core" "$root/transport/bin/receiver" \
     --shm "$out_shm" --slots "$out_slots" --port "$port" \
     ${bind_addr:+--bind "$bind_addr"} --core "$receiver_core" \
-    --busy-poll "$busy_poll" --idle-ms 3000 &
+    --backend "$backend" \
+    $([[ "$backend" == iouring ]] && echo "--iou-poll $iou_poll" || echo "--busy-poll $busy_poll") \
+    --idle-ms 3000 &
   pids+=($!)
   sleep 0.3
   taskset -c "$consumer_core" "$root/harness/bin/consumer" \
@@ -125,7 +140,10 @@ start_sender_side() {
   taskset -c "$sender_core" "$root/transport/bin/sender" \
     --shm "$src_shm" --slots "$src_slots" \
     "${peer_args[@]}" --port "$port" --datagram "$datagram" \
-    --core "$sender_core" --count "$count" --idle-ms 3000 &
+    --core "$sender_core" --count "$count" --idle-ms 3000 \
+    --backend "$backend" \
+    $([[ "$sqpoll" == 1 ]] && echo "--sqpoll") \
+    ${sq_core:+--sq-core "$sq_core"} &
   sender_pid=$!
   pids+=("$sender_pid")
 }

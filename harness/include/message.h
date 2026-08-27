@@ -62,7 +62,7 @@ struct Instrument {
 };
 
 inline constexpr Instrument kInstruments[] = {
-    {"BTCUSDT", "BINANCE", "BTC", "USDT"},
+    {"BTCUSDT", "EXCHANGE", "BTC", "USDT"},
 };
 inline constexpr uint16_t kInstrumentCount =
     static_cast<uint16_t>(sizeof(kInstruments) / sizeof(kInstruments[0]));

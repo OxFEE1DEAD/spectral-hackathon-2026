@@ -1,0 +1,4 @@
+run,datagrams_recvd,datagram_gaps,datagram_reorder,published,suppressed,verdict
+xg_base_200k,12365898,0,0,12365916,0,clean
+xg_tx_200k,19439546,0,11995603,7443982,11995625,two senders
+xg_split_200k,18701403,0,11263771,7437621,11263800,two senders

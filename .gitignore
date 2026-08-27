@@ -21,3 +21,10 @@ scripts/bench.env
 
 # Jupyter writes these next to the notebook.
 .ipynb_checkpoints/
+
+# Python bytecode from running the aggregation scripts.
+__pycache__/
+*.pyc
+
+# Measurement tool binaries.
+tools/bin/

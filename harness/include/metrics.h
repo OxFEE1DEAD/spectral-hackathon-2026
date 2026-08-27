@@ -183,17 +183,24 @@ class StageAccumulator {
     shm_.resize(capacity);
     wire_.resize(capacity);
     pub_.resize(capacity);
+    rxdel_.resize(capacity);
     std::memset(seq_.data(), 0, seq_.size() * sizeof(uint64_t));
     std::memset(shm_.data(), 0, shm_.size() * sizeof(uint32_t));
     std::memset(wire_.data(), 0, wire_.size() * sizeof(uint32_t));
     std::memset(pub_.data(), 0, pub_.size() * sizeof(uint32_t));
+    std::memset(rxdel_.data(), 0, rxdel_.size() * sizeof(uint32_t));
   }
 
   bool enabled() const { return !seq_.empty(); }
   size_t stored() const { return n_; }
 
-  void record(uint64_t seq, uint64_t shm_ns, uint64_t wire_ns,
-              uint64_t publish_ns) {
+  // rx_delivery_ns splits the wire leg at the receiver's own kernel: the gap between the
+  // timestamp the kernel took when the packet entered its receive path and the moment our
+  // recv returned. Both readings come from one clock on one host, so unlike the rest of
+  // the wire leg this needs no cross-host synchronisation and is exact. Zero means the
+  // caller did not ask for receive timestamping.
+  void record(uint64_t seq, uint64_t shm_ns, uint64_t wire_ns, uint64_t publish_ns,
+              uint64_t rx_delivery_ns = 0) {
     if (n_ >= seq_.size()) {
       ++overflow_;
       return;
@@ -202,6 +209,7 @@ class StageAccumulator {
     shm_[n_] = clamp32(shm_ns);
     wire_[n_] = clamp32(wire_ns);
     pub_[n_] = clamp32(publish_ns);
+    rxdel_[n_] = clamp32(rx_delivery_ns);
     ++n_;
   }
 
@@ -210,13 +218,13 @@ class StageAccumulator {
     if (fd < 0) return false;
     std::string buf;
     buf.reserve(1u << 23);
-    buf += "seq,shm_ns,wire_ns,publish_ns\n";
-    char line[80];
+    buf += "seq,shm_ns,wire_ns,publish_ns,rx_delivery_ns\n";
+    char line[96];
     bool ok = true;
     for (size_t i = 0; i < n_ && ok; ++i) {
-      const int len = std::snprintf(line, sizeof(line), "%llu,%u,%u,%u\n",
+      const int len = std::snprintf(line, sizeof(line), "%llu,%u,%u,%u,%u\n",
                                     (unsigned long long)seq_[i], shm_[i],
-                                    wire_[i], pub_[i]);
+                                    wire_[i], pub_[i], rxdel_[i]);
       buf.append(line, static_cast<size_t>(len));
       if (buf.size() >= (1u << 23)) ok = flush(fd, buf);
     }
@@ -241,7 +249,7 @@ class StageAccumulator {
   }
 
   std::vector<uint64_t> seq_;
-  std::vector<uint32_t> shm_, wire_, pub_;
+  std::vector<uint32_t> shm_, wire_, pub_, rxdel_;
   size_t n_ = 0;
   uint64_t overflow_ = 0;
 };
