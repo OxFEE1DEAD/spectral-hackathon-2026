@@ -18,8 +18,6 @@ commit, and **no number in this repository comes from them.** Everything in `dat
 our own, written by `scripts/ab_bench.sh`, one row per arm-run, committed unedited
 including the runs marked invalid.
 
-things that were tried and did not work.
-
 ## The bench, and why absolute numbers are absent
 
 Two `m7i.2xlarge`, one subnet, one availability zone, cluster placement group, Ubuntu
@@ -36,6 +34,30 @@ idle `clock_probe` bracketing each block put the offset movement between two arm
 block at up to ±1,400 ns — the same order as the p99 difference being looked for. That
 number is measured, not assumed, and it is why several results below are reported rather
 than claimed.
+
+## What is claimed
+
+Every row is a counterbalanced block A/B against a control arm that reproduces the
+baseline's behaviour in the same binary. `p` is a two-sided sign test over blocks; its
+floor is `2 / 2^N`, so six blocks cannot go below 0.031 and twelve reach 0.0005.
+
+| | | blocks | p |
+|---|---|---|---|
+| first-copy loss, 100k msg/s | −0.78 pp | 12/12 | 0.000 |
+| end-to-end p99, 100k | −2,046 ns | 10/12 | 0.039 |
+| end-to-end p99.9, 100k | −6,389 ns | 11/12 | 0.006 |
+| end-to-end p99.99, 100k | −784,097 ns | 10/12 | 0.039 |
+| `rx_delivery` p99, Trade-only vs all copies | −1,417 ns | 6/6 | 0.031 |
+| under 0.5 % independent loss: frames rescued | 18,462 | 6/6 | 0.031 |
+| the same, Trade-only | 6,132, i.e. its exact third | 6/6 | 0.031 |
+| cost of copying everything, e2e p99 | +4,955 ns | 6/6 | 0.031 |
+| under burst loss: staggered copy rescues | 5,538 frames, 96.7 % of protected Trades | 6/6 | 0.031 |
+| the same, cost at p99.9 | +298,410 ns | 6/6 | 0.031 |
+| fixed destination order puts the same peer behind | +1,356 ns median | 6/6 | 0.031 |
+
+Deliberately absent: end-to-end p50, which never resolves; the *magnitude* of the fan-out
+skew reduction (4/5 blocks, p = 0.375); and the burst-loss rescue from an immediate copy,
+which is 3.8 % and indistinguishable from nothing.
 
 ## Four changes
 
@@ -162,25 +184,75 @@ bound what a kernel-bypass transmit path might save. Splitting it would take har
 `SO_TIMESTAMPING` on both sides — the receive half is already in `udp_backend.h`, the
 transmit half is not — and that was not run.
 
+## Measured and did not work
+
+Reporting these is not modesty. Each was expected to help, and the design that survives is
+the one whose failures are known.
+
+| idea | result |
+|---|---|
+| temporal stagger + bitmap gate, aimed at the `memset` hole | six blocks, nothing resolved; 130 frames rescued out of 47,543. The mechanism was sound and the target was wrong — under burst loss it resolves, see change 2 |
+| two-threaded receive (`--split-poll`) | nothing resolved: `rx_delivery` p99 3/6 blocks, e2e p99 4/6. It also lost frames where the single-threaded path lost none, 199 and 300 in two blocks — the handoff queue overflows. The baseline reports it worth 24 µs at the median on a 96-core host; on four cores the extra thread and the extra copy of every datagram pay for themselves and no more |
+| ENA interrupt moderation off | 5k/s: 17,030 → 16,963 ns, unchanged. 20k/s: 13,364 → 14,813 ns, worse. Busy-poll drives NAPI directly and never waits for the interrupt |
+| `IP_TOS` = `IPTOS_LOWDELAY` | +6.6 µs at p50 over four runs. Removed |
+| io_uring send backend | e2e p50 median difference −402 ns against a between-block spread of 6,319; sign p = 0.625 |
+| hand-applied clock-offset correction | produced a clean 6/6 on p50 and p99, and was withdrawn: the correction assigned to each arm correlated with that arm's position in the block, and the jump between adjacent probes minutes apart was as large as the drift being interpolated |
+
+## Two corrections to earlier drafts
+
+**The wire-leg floor argument was circular.** An earlier draft said the transport's wire leg
+equals a bare ping-pong, therefore the path has no software left in it and a kernel-bypass
+transmit path would save nothing. `clock_probe` opens `SOCK_DGRAM` with `SO_BUSY_POLL` — the
+same kernel path — so that cost sits on *both* sides and cancels rather than being bounded.
+The agreement establishes that this transport adds nothing over a bare UDP echo, and no
+more. AF_XDP was dismissed on the wrong reasoning and is recorded below as untested.
+
+**The sign test counted tied blocks as losses.** Six blocks of which four are exactly equal
+would read 0/6, sign p = 0.031, when the honest answer is 0/2, p = 0.5. Ties are discarded
+now. No claim in this document was affected — every published comparison has non-zero
+differences in every block — but the split-poll result was, and it is reported above at its
+true strength rather than its inflated one.
+
 ## Constraints not accounted for
 
-* **Loss was never injected.** The task describes a channel losing 0.01–1 %. This path
-  loses ~10⁻⁵ (26 datagrams in 9.9M; 274 in 9.5M). Every loss result here says the
-  transport stopped losing frames *to itself*. Trade-only redundancy is argued from the
-  format, not demonstrated under the loss the task describes. This is the largest gap.
-* **Fan-out was never measured** — see change 3.
-* **Multicast is unavailable.** One send for N receivers is the right shape for fan-out and
-  EC2 VPC does not carry multicast between instances. On a physical LAN it would likely
-  dominate every fan-out result here.
-* **1M msg/s could not be measured** on this bench: the consumer collected zero samples
-  while the sender emitted 38M datagrams per run, and this is where the ENI's
-  `pps_allowance_exceeded` counter moved. Bench ceiling, not transport ceiling.
-* **A 1–3 ms stall on the receive path remains unexplained.** Its frequency tracks datagram
-  rate rather than elapsed time, so halving the copy stream halves it, but that is a
-  consequence and not a cure. The sender, consumer scheduling, IPIs and TLB shootdowns,
-  timer ticks, interrupt moderation, THP and systemd timers are each excluded with the
-  counter that excludes them. When no stall lands in the window, p99.99 is 43–110 µs.
-* **The measured surface is narrow**: 100k–500k msg/s, fan-out 1.
+* **A 1–3 ms stall on the receive path is unexplained.** It is the largest single number in
+  the system. Its frequency tracks datagram rate rather than elapsed time, so halving the
+  copy stream halves it, but that is a consequence and not a cure. Excluded, each with the
+  counter that excludes it: the sender (`send_all` max 656 µs, two calls over 100 µs in
+  9.47M datagrams); consumer scheduling (`SCHED_FIFO` changed nothing); IPIs and TLB
+  shootdowns (0 shootdowns and ~0.05 IPIs/s on the isolated cores over 16 hours);
+  timer ticks (`nohz_full` working); ENA PPS shaping (`pps_allowance_exceeded` did not move
+  under load); interrupt moderation, THP and systemd timers (none matched the period); and
+  **the host taking the core away** — a thread whose only instruction is a clock read, on
+  the spare isolated core, saw zero gaps above 1 ms over ~160 s across idle, partial and
+  full load, with `/proc/stat` steal moving 0–1 ticks. That narrows it to the receive path
+  below our userspace and does not identify it.
+* **Loss was modelled, not observed.** Independent and bursty loss are injected with
+  `netem`, and the burst parameters were chosen to resemble the baseline's reported
+  ~69-datagram runs rather than measured on a channel that behaves that way. A real lossy
+  path may correlate loss with load, which neither model does.
+* **Fan-out was measured at two receivers on the wrong number of cores.** Two receivers need
+  four isolated cores and this bench has three, so one consumer ran on the housekeeping core
+  alongside the interrupts. Enough for the mechanism and its sign, not for the magnitude,
+  and nothing here extrapolates to ten receivers.
+* **Multicast was not tried.** One send for N receivers is the right shape for fan-out. EC2
+  does not carry multicast between instances inside a VPC, but Transit Gateway multicast
+  domains exist; that route adds a gateway hop and was not measured, so "unavailable" would
+  overstate it. On a physical LAN multicast would likely dominate every fan-out result here.
+* **AF_XDP is untested, not rejected.** The backend's own notes record this driver refusing
+  `XDP_ZEROCOPY`, leaving `XDP_COPY` through `xsk_generic_xmit`. Whether that still saves
+  anything is unknown, because the measurement that would have bounded it was the circular
+  one corrected above.
+* **The 13.4 µs wire leg is not split.** Hardware `SO_TIMESTAMPING` would separate
+  NIC-to-NIC from kernel stack, and `ethtool -T` reports `PTP Hardware Clock: none` on this
+  driver — so on this hardware it cannot be done at all, and software stamps are the ceiling.
+* **Nothing was done to reduce bytes or packet rate.** Frames are relayed verbatim; at
+  1M msg/s the run hits the ENI's `pps_allowance_exceeded` and the consumer collects zero
+  samples, so packet rate is the ceiling and field-level compaction is the untouched lever.
+* **The stagger is a constant, not a measurement.** 64 datagrams is longer than the burst
+  that was injected. Expressed in microseconds and derived from an observed burst-length
+  histogram it would carry across rates; it does not.
+* **The measured surface is narrow**: 100k–500k msg/s, fan-out 1 and 2.
 
 ## Reproducing
 
@@ -229,9 +301,10 @@ Arms are interleaved and counterbalanced by the script — A,B then B,A — beca
 hosts' clocks drift and a cross-host figure measured fifteen minutes after its baseline
 carries an unknown offset the size of the effect.
 
-### The path floor
+### The path, without trusting either clock
 
-Round trip on one clock, turnaround on the other, so no clock offset survives:
+Round trip on one clock, turnaround on the other, so no clock offset survives. Note this
+measures a UDP echo, not the physical path — see the correction above:
 
 ```bash
 # on the receiver
