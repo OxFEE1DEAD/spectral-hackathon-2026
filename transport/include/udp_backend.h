@@ -81,6 +81,9 @@ struct Options {
   // stamp, the interval it yields is two readings of one clock on one host, so it is exact
   // and needs no cross-host synchronisation. Measurement-only.
   bool tx_timestamp = false;
+  // Serve peers in a fixed order, as the baseline does. Kept so the rotation below can be
+  // measured against it in one binary rather than across two builds.
+  bool fixed_order = false;
   // Ask the kernel to stamp each datagram as it enters the receive path, so the wire leg
   // can be split at the receiver's own kernel boundary. Measurement-only: it turns the
   // hot-path recv() into a recvmsg() with a control buffer to parse, which is exactly the
@@ -207,6 +210,7 @@ class Sender {
       fprintf(stderr, "no peers given\n");
       return false;
     }
+    fixed_order_ = opts.fixed_order;
     addrs_.resize(peers.size());
     for (size_t i = 0; i < peers.size(); ++i) {
       if (!resolve(peers[i], default_port, &addrs_[i])) return false;
@@ -381,7 +385,7 @@ class Sender {
   // compare, spreads the penalty evenly, and leaves every receiver with the same mean.
   int send_all(const void* buf, uint32_t len) {
     const size_t n_peers = addrs_.size();
-    const size_t start = n_peers ? (rr_++ % n_peers) : 0;
+    const size_t start = (n_peers && !fixed_order_) ? (rr_++ % n_peers) : 0;
     switch (method_) {
       case SendMethod::kConnected: {
         int reached = 0;
@@ -428,6 +432,7 @@ class Sender {
   bool tx_timestamp_ = false;
   uint32_t tx_next_id_ = 0;
   size_t rr_ = 0;   // rotating start index for fan-out, see send_all
+  bool fixed_order_ = false;
   std::vector<uint64_t> presend_;
   std::vector<uint32_t> tx_samples_;
   uint64_t tx_unmatched_ = 0;

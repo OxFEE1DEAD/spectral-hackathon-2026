@@ -1,0 +1,27 @@
+ab_bench run
+date_utc         : 2026-08-30T16:22:20Z
+commit           : 2e22615484c2434d7c89c93aee342db63a7702b4
+tree_dirty       : 5 file(s) modified
+blocks           : 6
+rate             : 200000
+samples_per_block: 2000000
+drop             : 16384
+warmup_ms        : 8000
+datagram         : 1472
+cores            : producer=1 sender=2 receiver=1 consumer=2
+offset_probe     : 0
+arm[0]           : single | send='--dup-trades' | recv='--rx-tstamp'
+arm[1]           : split | send='--dup-trades' | recv='--rx-tstamp --split-poll --publish-core 3'
+
+--- host sender ---
+kernel           : 7.0.0
+clock            : RMS offset      : 0.000000478 seconds
+clock            : Root dispersion : 0.000035080 seconds
+cores_total      : 4
+cores_available  : 1
+--- host receiver ---
+kernel           : 7.0.0
+clock            : RMS offset      : 0.000000670 seconds
+clock            : Root dispersion : 0.000031269 seconds
+cores_total      : 4
+cores_available  : 1

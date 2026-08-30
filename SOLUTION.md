@@ -84,7 +84,32 @@ Trade-only and 2,036 ns for no redundancy at all, six blocks, every block agreei
 sign p = 0.031. Trade-only captures about 70 % of the benefit of switching redundancy off
 while keeping the protection.
 
-**Not claimed**: end-to-end p99, which moves the same way by 4.7–5.1 µs and never resolves.
+**Measured under loss, not only argued.** With `netem loss 0.5 %` injected, Trade-only
+rescues frames at exactly the ratio the design predicts: `undelivered` falls to 0.673 of
+the no-redundancy arm against a predicted 2/3, because Trade is one message in three. Full
+duplication rescues more but costs +4,955 ns at end-to-end p99 and +2,616 ns at
+`rx_delivery` p99 — both unanimous over six blocks — where Trade-only costs +888 ns.
+
+**Measured under bursts, where an immediate copy is worthless.** With
+`netem loss gemodel` supplying runs of ~20 datagrams, a copy sent immediately rescues
+3.8 % — indistinguishable from nothing, 4/6 blocks, sign p = 0.688 — which reproduces the
+baseline's own report of duplication rescuing 2 losses out of 485. Held back 64 datagrams
+and admitted by the bitmap gate, the same copy rescues 32.2 % of all losses against a
+ceiling of 33.3 %: **96.7 % of the Trades it protects**. The baseline proposes precisely
+this fix and states the gate "already absorbs a late copy"; `MonotonicGate::admit` rejects
+any `seq_id <= last_`, so the fix cannot work in the code proposing it. `BitmapGate` is the
+missing half.
+
+The cost of the stagger is +298,410 ns at p99.9, unanimous — and that figure needs reading
+rather than quoting. The rescued frames are 0.308 % of samples, so they occupy everything
+above p99.692; p99.9 is inside that band and p99, which shows no effect at all, is outside.
+More importantly the two arms are not measuring the same population: the frames that make
+the staggered arm look slower do not exist in the other arm, having been lost. Below
+p99.69 the stagger costs nothing measurable; above it, 0.31 % of messages arrive ~320 µs
+late **instead of not arriving.**
+
+**Not claimed**: end-to-end p99 under redundancy, which moves the same way by 4.7–5.1 µs
+and never resolves.
 
 ### 3. Fan-out rotates its destination order
 
@@ -94,9 +119,22 @@ is therefore a fixed penalty attached to a fixed receiver, not jitter that avera
 Advancing the starting index by one per datagram costs an add and a compare and leaves
 every receiver with the same mean.
 
-**Untested.** This bench has four cores and `bench.sh` needs `(cores − 1) / 2` receivers,
-so every run here is fan-out 1, where the rotation is a no-op. The change is in
-`udp_backend.h` and it is argued, not measured. It should be treated as untested code.
+**Resolved, for the part that matters.** `ab_bench.sh` hard-wired `--receivers 1`, which
+makes the axis the task judges most explicitly unmeasurable with its own harness; adding the
+flag was the prerequisite. At two receivers, with `--fixed-order` restoring the baseline's
+behaviour in the same binary:
+
+* fixed order puts the second peer behind the first in **6 of 6 blocks**, median +1,356 ns,
+  sign p = 0.031. The penalty is systematic and attached to one receiver, which is the
+  claim the change is built on;
+* with rotation the direction is gone — 3 of 5 blocks, median +46 ns.
+
+**Not claimed**: the magnitude. `|skew|` falls in 4 of 5 usable blocks, sign p = 0.375, with
+the median dropping 1,260 → 105 ns. Two receivers need four isolated cores and this bench
+has three, so one consumer ran on the housekeeping core; one block's median went into the
+milliseconds and is dropped and counted. That is enough to establish the mechanism and its
+sign, not enough to trust the size or to extrapolate to the ten receivers the baseline
+reports.
 
 ### 4. A build failure fails the run
 
@@ -113,14 +151,16 @@ source-ring wait ~460 ns, ring publish ~195 ns, wire leg ~22,000–26,000 ns. **
 is ~660 ns of ~24,000.**
 
 An idle `clock_probe` — round trip on one clock, turnaround on the other, so no clock
-offset survives — puts the bare path at 13,364 ns one-way at 20,000 pings/s. Our loaded
-`wire_ns` p50 is 13,4xx ns. **The transport's wire leg equals a bare ping-pong on the same
-path.** There is no software left in it to remove, ours or the baseline's.
+offset survives — measures 13,364 ns one-way at 20,000 pings/s. Our loaded `wire_ns` p50 is
+13,4xx ns.
 
-That single fact explains every non-result in the notebook. Three independent 6-block runs
-put end-to-end p99 in our favour by 1.7–5.1 µs and none resolved, because the effect is
-smaller than the noise on the ruler — and section "the bench" above quantifies that noise
-rather than blaming it.
+That agreement says **the transport adds nothing measurable on top of a bare UDP echo on
+this path**, and no more than that. The probe opens `SOCK_DGRAM` with `SO_BUSY_POLL`, so
+the kernel's UDP receive and transmit cost is inside *both* numbers and cancels rather than
+being bounded. It does not establish that 13.4 µs is the physical path, and it does not
+bound what a kernel-bypass transmit path might save. Splitting it would take hardware
+`SO_TIMESTAMPING` on both sides — the receive half is already in `udp_backend.h`, the
+transmit half is not — and that was not run.
 
 ## Constraints not accounted for
 

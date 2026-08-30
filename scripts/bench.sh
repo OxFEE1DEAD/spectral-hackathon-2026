@@ -71,6 +71,7 @@ send_method=""
 # separate builds minutes apart.
 stagger=""
 dup_trades=0
+fixed_order=0
 delivery=""
 late_alloc=0
 no_duplicate=0
@@ -155,7 +156,8 @@ while [[ $# -gt 0 ]]; do
     --busy-poll) recv_busy_poll="$2"; shift 2 ;;  # force it, for the same comparison
     --send-method) send_method="$2"; shift 2 ;;   # auto|sendmmsg|sendto|connected
     --stagger) stagger="$2"; shift 2 ;;
-    --dup-trades) dup_trades=1; shift ;;           # datagrams to hold a redundant copy back by
+    --dup-trades) dup_trades=1; shift ;;
+    --fixed-order) fixed_order=1; shift ;;           # datagrams to hold a redundant copy back by
     --delivery) delivery="$2"; shift 2 ;;
     --late-alloc) late_alloc=1; shift ;;         # monotonic|bitmap
     --no-duplicate) no_duplicate=1; shift ;;      # isolate fan-out cost from redundancy
@@ -368,6 +370,7 @@ start_stream() {
     ${send_method:+--send-method "$send_method"} \
     ${stagger:+--stagger "$stagger"} \
     $( [[ $dup_trades -eq 1 ]] && echo --dup-trades ) \
+    $( [[ $fixed_order -eq 1 ]] && echo --fixed-order ) \
     $( [[ $sqpoll -eq 1 ]] && echo --sqpoll ) \
     ${sq_core:+--sq-core "$sq_core"} \
     $( [[ $no_duplicate -eq 1 ]] && echo --no-duplicate ) &

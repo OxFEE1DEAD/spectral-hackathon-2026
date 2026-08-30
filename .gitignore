@@ -35,3 +35,6 @@ results/
 infra/.terraform/
 infra/*.tfstate*
 infra/.terraform.lock.hcl
+
+# Рабочий план, не для сдачи.
+PLAN.tmp.md

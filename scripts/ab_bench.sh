@@ -85,6 +85,10 @@ producer_core=2
 sender_core=4
 receiver_core=1
 consumer_core=11
+# Ours: see the fan-out section of SOLUTION.md. Fan-out was hard-wired to one receiver
+# here, which makes the axis the task judges most explicitly unmeasurable with this
+# harness. The core arguments take a space-separated list when this is above one.
+receivers=1
 stage_capacity=25000000
 out_dir=""
 offset_probe=0
@@ -128,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --producer-core) producer_core="$2"; shift 2 ;;
     --sender-core) sender_core="$2"; shift 2 ;;
     --receiver-core) receiver_core="$2"; shift 2 ;;
+    --receivers) receivers="$2"; shift 2 ;;
     --consumer-core) consumer_core="$2"; shift 2 ;;
     --stage-capacity) stage_capacity="$2"; shift 2 ;;
     --out) out_dir="$2"; shift 2 ;;
@@ -333,7 +338,7 @@ run_arm() {  # block index tag
   # dropped, so starting the sender early costs nothing and removes the race.
   sh_ "$send_host" "rm -f $remote_dir/log_s_$tag" >/dev/null 2>&1
   if ! launch_once "$send_host" \
-    "./scripts/bench.sh --role send --peer $recv_ip --receivers 1 --port $port --rate $rate --producer-core $producer_core --sender-core $sender_core --src-slots $src_slots --datagram $datagram ${src_addr:+--src-addr $src_addr} $xs > $remote_dir/log_s_$tag 2>&1" \
+    "./scripts/bench.sh --role send --peer $recv_ip --receivers $receivers --port $port --rate $rate --producer-core $producer_core --sender-core $sender_core --src-slots $src_slots --datagram $datagram ${src_addr:+--src-addr $src_addr} $xs > $remote_dir/log_s_$tag 2>&1" \
     "sender|producer"; then
     echo "$block,${arm_names[$idx]},0,,,,,,,,,,,,,,,,,$(date +%s),$(( $(date +%s) - arm_start )),sender-never-started" >> "$results"
     echo "  | block $block ${arm_names[$idx]}: sender never started"
@@ -344,7 +349,7 @@ run_arm() {  # block index tag
   sleep "$sender_head_start_s"
   sh_ "$recv_host" "rm -f $remote_dir/.done_$tag $remote_dir/log_$tag; rm -rf $remote_dir/data/$tag" >/dev/null 2>&1
   if ! launch_once "$recv_host" \
-    "./scripts/bench.sh --role recv --receivers 1 --reps 1 --samples $samples --bind $recv_ip --port $port --receiver-cores \" $receiver_core\" --consumer-cores \" $consumer_core\" --out-slots $out_slots --warmup-ms $warmup_ms --stages --stage-capacity $stage_capacity $xr --tag $tag --out-dir $remote_dir/data/$tag > $remote_dir/log_$tag 2>&1; echo \$? > $remote_dir/.done_$tag" \
+    "./scripts/bench.sh --role recv --receivers $receivers --reps 1 --samples $samples --bind $recv_ip --port $port --receiver-cores \" $receiver_core\" --consumer-cores \" $consumer_core\" --out-slots $out_slots --warmup-ms $warmup_ms --stages --stage-capacity $stage_capacity $xr --tag $tag --out-dir $remote_dir/data/$tag > $remote_dir/log_$tag 2>&1; echo \$? > $remote_dir/.done_$tag" \
     "receiver|consumer"; then
     echo "$block,${arm_names[$idx]},0,,,,,,,,,,,,,,,,,$(date +%s),$(( $(date +%s) - arm_start )),receiver-never-started" >> "$results"
     echo "  | block $block ${arm_names[$idx]}: receiver never started"

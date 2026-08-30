@@ -154,6 +154,7 @@ struct Config {
   // one is stale state and must not be applied; a Trade copy is a historical record and
   // is still exactly correct however late it lands.
   bool dup_trades_only = false;
+  bool fixed_order = false;
   uint32_t stagger = 0;
 
   // --- the redundant leg: dual path's four-tuple, opportunistic duplication's timing ---
@@ -262,6 +263,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--src-addr") c.src_addr = next();
     else if (a == "--dual-path") c.dual_path = true;
     else if (a == "--dup-trades") c.dup_trades_only = true;
+    else if (a == "--fixed-order") c.fixed_order = true;
     else if (a == "--stagger") c.stagger = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--dup-path") c.dup_path = true;
     else if (a == "--dup-backend") {
@@ -824,6 +826,7 @@ int main(int argc, char** argv) {
   }
   udp::Options opts;
   opts.src_addr = cfg.src_addr;
+  opts.fixed_order = cfg.fixed_order;
   udp::Sender net;
   if (!net.open(peers, cfg.port, opts, cfg.method)) return 1;
   if (cfg.tx_timestamp && !net.enable_tx_timestamps()) {
