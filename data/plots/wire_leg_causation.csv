@@ -1,4 +1,0 @@
-backend,samples,corr_shm_wire,shm_p50_all,shm_p50_worst_wire,spike_threshold_ns,spikes,bursts,msgs_per_burst,adjacent_pct
-kernel-udp,8372224,-0.0032,5791,5553,766926,838,19,44.1,97.7
-io_uring,8372224,0.0004,5321,5343,65500,838,213,3.9,74.6
-afxdp-copy,8372224,-0.0006,3767,3752,79141,838,154,5.4,81.6

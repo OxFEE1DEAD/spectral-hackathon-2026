@@ -3,12 +3,11 @@ bin/
 *.o
 
 # Measurement output. The raw per-message samples are hundreds of megabytes per
-# configuration and are not committed; the small aggregates the notebook plots from
-# are, so every figure can be regenerated and reviewed in a diff.
+# configuration and are not committed. The per-arm summaries the notebook reads are
+# kilobytes and are committed, so every figure can be regenerated and diffed.
 data/*
-!data/plots/
-data/plots/*
-!data/plots/*.csv
+!data/ab_*/
+!data/sweep_*/
 *.json.gz
 
 # Capture files never belong in this repository.
@@ -28,3 +27,11 @@ __pycache__/
 
 # Measurement tool binaries.
 tools/bin/
+
+# Local Python environment, and Terraform's local state and lock file: state names
+# live AWS resources and does not belong in a repository.
+.venv/
+results/
+infra/.terraform/
+infra/*.tfstate*
+infra/.terraform.lock.hcl

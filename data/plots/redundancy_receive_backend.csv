@@ -1,5 +1,0 @@
-receive_backend,redundancy,e2e_p50,e2e_p99,e2e_p999,e2e_p9999,publish_p50,note
-kernel UDP + SO_BUSY_POLL,off,34190,40743,110475,1172844,53,rx_delivery available
-kernel UDP + SO_BUSY_POLL,on,35792,45375,54436,74961,51,rx_delivery available
-io_uring multishot + provided buffers,off,61521,89811,221628,297891,43,no kernel receive timestamp
-io_uring multishot + provided buffers,on,53163,89712,243006,374579,45,no kernel receive timestamp

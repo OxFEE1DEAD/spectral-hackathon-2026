@@ -393,7 +393,17 @@ for h in "$send_host" "$recv_host"; do
       "$root/" "$h:$remote_dir/" 2>/dev/null && break
     sleep 5
   done
-  sh_ "$h" "cd $remote_dir && make -C harness -s all && make -C transport -s all && make -C tools -s all 2>/dev/null; echo BUILD_OK" | tail -1
+  # Ours: see PROVENANCE.md. `echo BUILD_OK` used to run unconditionally, so a compile
+  # error left the previous binaries in place and the whole matrix was measured against
+  # stale code that silently ignored the arm's flags. That is not a hypothetical: one
+  # three-arm run recorded "no-data" for every block of the arm whose flag was new.
+  # A build that does not build is a failed run, not a warning.
+  build_log=$(sh_ "$h" "cd $remote_dir && make -C harness all && make -C transport all && make -C tools all" 2>&1)
+  if [[ $? -ne 0 ]] || grep -qiE '\berror\b|Error [0-9]' <<< "$build_log"; then
+    echo "$build_log" | tail -20 >&2
+    die "build failed on $h"
+  fi
+  echo "  $h: build ok"
 done
 
 # Environment provenance, captured once from each host. Kernel release is deliberately

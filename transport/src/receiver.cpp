@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,13 @@ volatile std::sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
 
 struct Config {
+  // "monotonic" reproduces the baseline exactly; "bitmap" drops the ordering
+  // constraint so a copy held back longer than a loss burst still counts.
+  std::string delivery = "monotonic";
+  // Reproduces the baseline's construction order: instrumentation buffers built after the
+  // socket is already bound. Kept as a flag so the two orders can be measured against each
+  // other in one binary, back to back, instead of across two builds minutes apart.
+  bool late_alloc = false;
   std::string shm_name = "/fanout_out";
   uint32_t slots = 1024;
   uint16_t port = 51000;
@@ -110,6 +118,12 @@ struct Stats {
   uint64_t pkt_gaps = 0;     // times the first-copy pkt_seq sequence jumped
   uint64_t pkt_lost = 0;     // first-copy datagrams missing, from those jumps
   uint64_t pkt_reorder = 0;  // arrived behind one we had already seen
+  // Where the first gaps opened, in datagrams already received. A loss that is spread
+  // through the run and a single stall both show up as "n datagrams lost"; only the
+  // position separates them, and they call for opposite fixes.
+  static constexpr int kGapLog = 8;
+  uint64_t gap_at[kGapLog] = {0};
+  uint64_t gap_len[kGapLog] = {0};
   uint64_t dup_recv = 0;     // redundant copies that reached us
   // Copies whose frames passed the gate, i.e. that arrived before their original did.
   //
@@ -149,6 +163,8 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--idle-ms") c.idle_ms = std::stoull(next());
     else if (a == "--busy-poll") c.busy_poll_us = std::stoi(next());
     else if (a == "--spin") c.busy_poll_us = 0;
+    else if (a == "--delivery") c.delivery = next();
+    else if (a == "--late-alloc") c.late_alloc = true;
     else if (a == "--trace") c.trace = true;
     else if (a == "--stage-csv") c.stage_csv = next();
     else if (a == "--stage-capacity") c.stage_capacity = std::stoull(next());
@@ -189,13 +205,17 @@ Config parse_args(int argc, char** argv) {
   return c;
 }
 
-void print_stats(const Stats& s, const delivery::MonotonicGate::Stats& g) {
+void print_stats(const Stats& s, const delivery::Stats& g) {
   fprintf(stderr, "---- receiver ----\n");
   fprintf(stderr, "datagrams recvd : %llu\n", (unsigned long long)s.datagrams);
   fprintf(stderr, "frames delivered: %llu\n", (unsigned long long)s.frames);
   fprintf(stderr, "malformed       : %llu\n", (unsigned long long)s.malformed);
   fprintf(stderr, "datagram gaps   : %llu (%llu datagrams)\n",
           (unsigned long long)s.pkt_gaps, (unsigned long long)s.pkt_lost);
+  for (int i = 0; i < Stats::kGapLog && i < (int)s.pkt_gaps; ++i) {
+    fprintf(stderr, "  gap[%d]        : %llu datagrams, after %llu received\n", i,
+            (unsigned long long)s.gap_len[i], (unsigned long long)s.gap_at[i]);
+  }
   fprintf(stderr, "datagram reorder: %llu\n", (unsigned long long)s.pkt_reorder);
   const uint64_t offered = s.datagrams + s.pkt_lost;
   if (offered) {
@@ -214,6 +234,10 @@ void print_stats(const Stats& s, const delivery::MonotonicGate::Stats& g) {
           (unsigned long long)g.suppressed);
   fprintf(stderr, "seq gaps        : %llu (%llu frames never arrived)\n",
           (unsigned long long)g.gaps, (unsigned long long)g.missing);
+  if (g.rescued) {
+    fprintf(stderr, "rescued         : %llu frames admitted below the high-water mark\n",
+            (unsigned long long)g.rescued);
+  }
 }
 
 // The receive-side kernel delivery gap, where the backend can supply one.
@@ -244,8 +268,9 @@ class BorrowGuard {
 // The relay, written once against either backend. Both expose borrow()/release() with
 // the same contract: borrow() yields a pointer valid until release(), and release()
 // must happen before the next borrow().
-template <class ReceiverT>
-int run_relay(ReceiverT& net, const Config& cfg) {
+template <class ReceiverT, class GateT>
+int run_relay(ReceiverT& net, const Config& cfg, metrics::Accumulator& trace_acc,
+              metrics::StageAccumulator& stages) {
   shm::Segment seg = shm::Segment::open(cfg.shm_name,
                                         shm::region_size(cfg.slots),
                                         /*create=*/true);
@@ -260,9 +285,7 @@ int run_relay(ReceiverT& net, const Config& cfg) {
   Stats stats;
   // Every frame passes this gate, which is what makes the delivered stream strictly
   // monotonic and what silently absorbs the redundant copies.
-  delivery::MonotonicGate gate;
-  metrics::Accumulator trace_acc(cfg.trace ? (1u << 21) : 0);
-  metrics::StageAccumulator stages(cfg.stage_csv.empty() ? 0 : cfg.stage_capacity);
+  GateT gate;
   uint64_t next_pkt_seq = 0;  // 0 = nothing seen yet
   const uint64_t idle_ns = cfg.idle_ms * 1000000ull;
   uint64_t last_activity = util::now_ns();
@@ -289,6 +312,10 @@ int run_relay(ReceiverT& net, const Config& cfg) {
       if (next_pkt_seq == 0 || ps == next_pkt_seq) {
         next_pkt_seq = ps + 1;
       } else if (ps > next_pkt_seq) {
+        if (stats.pkt_gaps < Stats::kGapLog) {
+          stats.gap_at[stats.pkt_gaps] = stats.datagrams;
+          stats.gap_len[stats.pkt_gaps] = ps - next_pkt_seq;
+        }
         ++stats.pkt_gaps;
         stats.pkt_lost += ps - next_pkt_seq;
         next_pkt_seq = ps + 1;
@@ -449,12 +476,53 @@ int run_relay(ReceiverT& net, const Config& cfg) {
 
 }  // namespace
 
+// Chooses the delivery policy once, at startup, and hands the loop a concrete
+// type. Everything after this point is monomorphic: the policy that was not
+// chosen is not in the instruction stream and its window is never allocated.
+template <class ReceiverT>
+int run_with_policy(ReceiverT& net, const Config& cfg, metrics::Accumulator& trace_acc,
+                    metrics::StageAccumulator& stages) {
+  if (cfg.delivery == "bitmap")
+    return run_relay<ReceiverT, delivery::BitmapGate>(net, cfg, trace_acc, stages);
+  return run_relay<ReceiverT, delivery::MonotonicGate>(net, cfg, trace_acc, stages);
+}
+
 int main(int argc, char** argv) {
   Config cfg = parse_args(argc, argv);
+  if (cfg.delivery != "monotonic" && cfg.delivery != "bitmap") {
+    fprintf(stderr, "receiver: --delivery must be monotonic or bitmap\n");
+    return 1;
+  }
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
   if (cfg.core >= 0 && !cpu::pin_to_core(cfg.core)) return 1;
+
+  // Built before the socket exists, and that ordering is the whole point.
+  //
+  // StageAccumulator at --stage-capacity 25000000 reserves five arrays and zeroes them:
+  // roughly 600 MB of first-touch page faults, a few hundred milliseconds during which this
+  // thread does not call recv even once. Constructed after bind -- where these two lines
+  // used to live -- the socket is already accepting datagrams throughout, the receive buffer
+  // overruns, and the kernel discards whatever will not fit. At 200k datagrams/s that is a
+  // single contiguous hole of ~47,500 datagrams in every measured run, and it is what the
+  // baseline publishes as "first-copy loss 1.27%": the instrument, not the path. Six
+  // counterbalanced blocks put the difference at -1.30 percentage points, sign p=0.031,
+  // every block agreeing.
+  //
+  // It does not touch the latency percentiles, and that is worth stating because the
+  // opposite is the easy assumption. The hole opens while the receiver is starting, which
+  // bench.sh follows with an 8-second warm-up before the consumer takes its first sample,
+  // so the backlog that arrives late is never measured. In the same six blocks p99.9 and
+  // p99.99 did not resolve. Allocating first costs nothing and removes the loss.
+  std::unique_ptr<metrics::Accumulator> trace_acc;
+  std::unique_ptr<metrics::StageAccumulator> stages;
+  const auto build_instruments = [&] {
+    trace_acc = std::make_unique<metrics::Accumulator>(cfg.trace ? cfg.stage_capacity : 0);
+    stages = std::make_unique<metrics::StageAccumulator>(
+        cfg.stage_csv.empty() ? 0 : cfg.stage_capacity);
+  };
+  if (!cfg.late_alloc) build_instruments();
 
   if (cfg.backend == Backend::kIoUring) {
     iou::Options opts;
@@ -462,7 +530,8 @@ int main(int argc, char** argv) {
     opts.recv_buffers = cfg.recv_buffers;
     iou::Receiver net;
     if (!net.open(cfg.bind_addr, cfg.port, opts)) return 1;
-    const int rc = run_relay(net, cfg);
+    if (cfg.late_alloc) build_instruments();
+    const int rc = run_with_policy(net, cfg, *trace_acc, *stages);
     // Both are signs the receive path could not keep up in a way the datagram
     // counters alone would not show: a re-arm means multishot stopped and had to be
     // restarted, and an out-of-buffers event means the kernel had nowhere to put a
@@ -480,7 +549,8 @@ int main(int argc, char** argv) {
   opts.rx_timestamp = cfg.rx_timestamp;
   udp::Receiver net;
   if (!net.open(cfg.bind_addr, cfg.port, opts)) return 1;
-  const int rc = run_relay(net, cfg);
+  if (cfg.late_alloc) build_instruments();
+  const int rc = run_with_policy(net, cfg, *trace_acc, *stages);
   if (net.rx_timestamp() && net.missing_rx_stamps() != 0) {
     // A datagram with no stamp contributes a zero to the column, so the count has to be
     // reported or the distribution would be quietly biased toward zero.

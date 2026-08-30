@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y build-essential python3 python3-pip ethtool numactl rsync linux-tools-common linux-tools-aws
+
+systemctl disable --now irqbalance || true
+systemctl disable --now unattended-upgrades || true
+
+%{ if raise_socket_buffers ~}
+cat > /etc/sysctl.d/99-bench.conf <<'SYSCTL'
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+SYSCTL
+sysctl --system
+%{ endif ~}
+
+cat > /etc/default/grub.d/99-bench.cfg <<'GRUBCFG'
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=${isolated} nohz_full=${isolated} rcu_nocbs=${isolated} ${extra_cmdline}"
+GRUBCFG
+update-grub
+
+cat > /usr/local/sbin/bench-irq-pin <<'IRQ'
+#!/usr/bin/env bash
+for f in /proc/irq/*/smp_affinity_list; do
+  echo 0 > "$f" 2>/dev/null || true
+done
+IRQ
+chmod +x /usr/local/sbin/bench-irq-pin
+
+cat > /etc/systemd/system/bench-irq-pin.service <<'UNIT'
+[Unit]
+Description=Pin device interrupts to the housekeeping core
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bench-irq-pin
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable bench-irq-pin.service
+
+touch /var/lib/cloud/bench-ready
+reboot

@@ -133,6 +133,28 @@ struct Config {
   // Costs twice the packet rate, which trades directly against fan-out: the packet-rate
   // ceiling divided by destinations is already the binding constraint at high fan-out.
   bool dual_path = false;
+  // Datagrams to hold a redundant copy back by. 0 reproduces the baseline: the
+  // copy follows its original by microseconds. Loss here arrives in bursts of
+  // tens of datagrams, so a copy that close dies with the original; a stagger
+  // longer than a burst is what makes duplication rescue anything. Requires
+  // --delivery bitmap on the receiver.
+  // Which frames are worth a second copy. The format makes this decision for us:
+  // message.h states BBO and OrderBook are state snapshots, so a consumer that misses
+  // one recovers completely from the next -- and OrderBook is deliberately a full
+  // 5-level snapshot rather than a delta for exactly that reason. Only Trade carries
+  // something that cannot be re-derived: trade_id, and the price and size of that one
+  // print. Its running aggregates self-heal via cum_*, the print itself does not.
+  //
+  // So copying every datagram spends bandwidth and receiver time defending data that
+  // defends itself. Under --type mixed the producer emits seq % 3, one Trade in three,
+  // which takes the redundant load from 2.0x down to 1.33x with the protection left
+  // where loss is permanent.
+  //
+  // A late copy is safe here for the same reason. A BBO copy that arrives after a newer
+  // one is stale state and must not be applied; a Trade copy is a historical record and
+  // is still exactly correct however late it lands.
+  bool dup_trades_only = false;
+  uint32_t stagger = 0;
 
   // --- the redundant leg: dual path's four-tuple, opportunistic duplication's timing ---
   //
@@ -176,6 +198,15 @@ struct Stats {
   uint64_t datagrams = 0;      // distinct datagrams, not counting copies
   uint64_t duplicates = 0;     // redundant copies actually sent
   uint64_t dup_skipped = 0;    // copies dropped because new data arrived first
+  // How long send_all() itself took. The receiver's wire leg is measured from the stamp
+  // written just before this call, so a kernel that blocks here is indistinguishable from
+  // a slow network at the far end -- unless it is timed on this side too.
+  uint64_t send_max_ns = 0;
+  uint64_t send_slow = 0;      // calls over kSlowNs
+  static constexpr uint64_t kSlowNs = 100000;
+  static constexpr int kSlowLog = 8;
+  uint64_t slow_at[kSlowLog] = {0};
+  uint64_t slow_ns[kSlowLog] = {0};
   uint64_t lapped = 0;         // we fell behind the producer's ring
   uint64_t send_fail = 0;      // datagrams that reached no peer at all
   uint64_t partial = 0;        // datagrams that reached some but not all peers
@@ -230,6 +261,8 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--tx-tstamp") c.tx_timestamp = true;
     else if (a == "--src-addr") c.src_addr = next();
     else if (a == "--dual-path") c.dual_path = true;
+    else if (a == "--dup-trades") c.dup_trades_only = true;
+    else if (a == "--stagger") c.stagger = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--dup-path") c.dup_path = true;
     else if (a == "--dup-backend") {
       const std::string b = next();
@@ -306,6 +339,12 @@ void print_stats(const Stats& s) {
   fprintf(stderr, "source lapped   : %llu\n", (unsigned long long)s.lapped);
   fprintf(stderr, "send failed     : %llu\n", (unsigned long long)s.send_fail);
   fprintf(stderr, "send partial    : %llu\n", (unsigned long long)s.partial);
+  fprintf(stderr, "send_all max    : %llu ns, over 100us: %llu\n",
+          (unsigned long long)s.send_max_ns, (unsigned long long)s.send_slow);
+  for (int i = 0; i < Stats::kSlowLog && i < (int)s.send_slow; ++i) {
+    fprintf(stderr, "  slow[%d]       : %llu ns, after %llu datagrams\n", i,
+            (unsigned long long)s.slow_ns[i], (unsigned long long)s.slow_at[i]);
+  }
 }
 
 // Percentiles of the sending kernel's transmit path, if it was measured.
@@ -466,15 +505,36 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
     fprintf(stderr, "sender: -> %s\n", udp::describe(p).c_str());
   }
 
-  // Two datagram buffers used alternately. While one is being filled, the other
-  // still holds the datagram we sent last, so the redundant copy can be re-sent
-  // straight out of it -- no copy, no rebuild, nothing added to the hot path.
-  std::vector<uint8_t> pktbuf[2] = {std::vector<uint8_t>(cfg.datagram),
-                                    std::vector<uint8_t>(cfg.datagram)};
-  wire::Packer packers[2] = {{pktbuf[0].data(), cfg.datagram},
-                             {pktbuf[1].data(), cfg.datagram}};
-  int cur = 0;
-  // The previously sent datagram, still awaiting its redundant copy.
+  // A ring of datagram buffers. While one is being filled the others still hold
+  // datagrams already sent, so a redundant copy is re-sent straight out of one --
+  // no copy, no rebuild, nothing added to the hot path.
+  //
+  // Depth follows the stagger. With --stagger 0 this is two buffers alternating,
+  // which is exactly the baseline: the copy of datagram N goes out during the
+  // first idle moment after N, microseconds behind it. That is the arrangement
+  // measured to rescue 2 losses out of 485, because loss on this path arrives in
+  // bursts of tens of datagrams and a copy that close lands inside the same burst.
+  //
+  // With --stagger D the copy is held until D datagrams have passed, so it leaves
+  // after a burst of that length has ended. Holding it costs nothing on the hot
+  // path: copies are still only sent from the branch where the source ring was
+  // empty, so no live message ever waits behind one. It does need the receiver on
+  // --delivery bitmap, because by then later sequence numbers have been published
+  // and the monotonic gate would discard exactly the copy we held back for.
+  const uint32_t dup_depth = cfg.stagger + 2;
+  std::vector<std::vector<uint8_t>> pktbuf;
+  std::vector<wire::Packer> packers;
+  pktbuf.reserve(dup_depth);
+  packers.reserve(dup_depth);
+  for (uint32_t i = 0; i < dup_depth; ++i) pktbuf.emplace_back(cfg.datagram);
+  for (uint32_t i = 0; i < dup_depth; ++i) packers.emplace_back(pktbuf[i].data(), cfg.datagram);
+  uint32_t cur = 0;
+
+  // Datagrams sent but not yet duplicated, oldest first. dup_head is the one the
+  // next idle moment will consider.
+  struct Pending { uint32_t len = 0; uint64_t seq = 0; bool armed = false; };
+  std::vector<Pending> pending(dup_depth);
+  uint32_t dup_head = 0;
   uint8_t* dup_buf = nullptr;
   uint32_t dup_len = 0;
 
@@ -493,9 +553,24 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
   uint64_t last_activity = util::now_ns();
 
   while (!g_stop && (cfg.count == 0 || stats.frames < cfg.count)) {
+    // About to reuse this buffer. If its datagram is still waiting for a copy,
+    // that copy never found idle time and is now lost: redundancy loses to fresh
+    // data every time, and this counter is how the write-up shows it happening.
+    if (pending[cur].armed) {
+      ++stats.dup_skipped;
+      pending[cur].armed = false;
+      if (dup_head == cur) dup_head = (dup_head + 1) % dup_depth;
+    }
     wire::Packer& packer = packers[cur];
     packer.reset(pkt_seq + 1);
+    bool has_trade = false;
+    const auto is_trade = [](const uint8_t* f) {
+      msg::Header h;
+      std::memcpy(&h, f, sizeof(h));
+      return h.type == static_cast<uint8_t>(msg::Type::Trade);
+    };
     if (carry) {
+      if (is_trade(scratch)) has_trade = true;
       packer.add(scratch, carry_len);
       carry = false;
     }
@@ -520,6 +595,7 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
         carry_len = len;
         break;
       }
+      if (is_trade(scratch)) has_trade = true;
       packer.add(scratch, len);
     }
 
@@ -532,6 +608,21 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
       // it goes out microseconds after the original -- early enough that if the
       // original was lost, the copy still arrives before any later message exists
       // and can therefore pass the receiver's monotonic gate.
+      // Slots left unarmed because their datagram carried nothing worth copying are
+      // stepped over here. Without this the head parks on the first such slot and
+      // redundancy stops altogether rather than merely thinning out.
+      for (uint32_t skipped = 0;
+           skipped + 1 < dup_depth && !pending[dup_head].armed && dup_head != cur;
+           ++skipped) {
+        dup_head = (dup_head + 1) % dup_depth;
+      }
+      if (pending[dup_head].armed &&
+          pkt_seq - pending[dup_head].seq >= cfg.stagger) {
+        dup_buf = pktbuf[dup_head].data();
+        dup_len = pending[dup_head].len;
+        pending[dup_head].armed = false;
+        dup_head = (dup_head + 1) % dup_depth;
+      }
       if (dup_buf != nullptr) {
         wire::mark_duplicate(dup_buf);
         if (dup != nullptr) {
@@ -560,10 +651,7 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
 
     // New data arrived before we found idle time for the copy. Redundancy loses to
     // fresh data every time; this counter is how the write-up shows that happening.
-    if (dup_buf != nullptr) {
-      ++stats.dup_skipped;
-      dup_buf = nullptr;
-    }
+    dup_buf = nullptr;
 
     uint32_t dlen = 0;
     const uint8_t* dgram = packer.finish(&dlen);
@@ -585,22 +673,33 @@ int run_relay(SenderT& net, DupLeg* dup, const Config& cfg) {
     const uint64_t presend_ns = util::now_ns();
     wire::stamp_send_ts(const_cast<uint8_t*>(dgram), presend_ns);
     const int reached = net.send_all(dgram, dlen);
+    const uint64_t postsend_ns = util::now_ns();
     note_send_if_stamping(net, presend_ns);
+
+    const uint64_t send_ns = postsend_ns - presend_ns;
+    if (send_ns > stats.send_max_ns) stats.send_max_ns = send_ns;
+    if (send_ns > Stats::kSlowNs) {
+      if (stats.send_slow < Stats::kSlowLog) {
+        stats.slow_at[stats.send_slow] = stats.datagrams;
+        stats.slow_ns[stats.send_slow] = send_ns;
+      }
+      ++stats.send_slow;
+    }
 
     ++pkt_seq;
     ++stats.datagrams;
     stats.frames += packer.count();
     if (reached == 0) ++stats.send_fail;
     else if (static_cast<size_t>(reached) < net.peer_count()) ++stats.partial;
-    last_activity = util::now_ns();
+    last_activity = postsend_ns;
 
     // Hand this datagram to the duplication slot and switch buffers, so filling the
     // next one cannot overwrite the bytes the copy will be sent from.
     if (cfg.duplicate || cfg.dup_path) {
-      dup_buf = pktbuf[cur].data();
-      dup_len = dlen;
-      cur ^= 1;
+      pending[cur] = Pending{dlen, pkt_seq, true};
+      if (cfg.dup_trades_only && !has_trade) pending[cur].armed = false;
     }
+    cur = (cur + 1) % dup_depth;
   }
 
   print_stats(stats);

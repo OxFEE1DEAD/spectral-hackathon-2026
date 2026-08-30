@@ -1,0 +1,64 @@
+#gate
+malformed       : 0
+datagram gaps   : 0 (0 datagrams)
+datagram reorder: 0
+first-copy loss : 0.0000%
+duplicates recvd: 1901654
+  arrived first  : 0 copies admitted before their original
+                    not a recovery count -- see seq gaps below)
+published       : 6256811
+suppressed      : 1902365 (duplicate or too late to insert)
+seq gaps        : 0 (0 frames never arrived)
+#legs
+shm_ns           n=6194243 p50=515 p99=1663 p99.9=2112 p99.99=3450 max=18732
+wire_ns          n=6194243 p50=21142 p99=44974 p99.9=72793 p99.99=252423 max=384862
+publish_ns       n=6194243 p50=45 p99=159 p99.9=310 p99.99=464 max=13428
+rx_delivery_ns   no samples
+#e2e
+[
+  {
+    "name": "ab_b1_ours",
+    "runs": 1,
+    "reps": 1,
+    "consumers": 1,
+    "excluded_files": 0,
+    "samples_per_run": 1983616,
+    "samples_pooled": 1983616,
+    "min": {
+      "median": 16397,
+      "lo": 16397,
+      "hi": 16397
+    },
+    "p50": {
+      "median": 22122,
+      "lo": 22122,
+      "hi": 22122
+    },
+    "p99": {
+      "median": 42261,
+      "lo": 42261,
+      "hi": 42261
+    },
+    "p99.9": {
+      "median": 65830,
+      "lo": 65830,
+      "hi": 65830
+    },
+    "p99.99": {
+      "median": 124257,
+      "lo": 124257,
+      "hi": 124257
+    },
+    "max": {
+      "median": 183334,
+      "lo": 183334,
+      "hi": 183334
+    },
+    "_resolvable": {
+      "p50": true,
+      "p99": true,
+      "p99.9": true,
+      "p99.99": true
+    }
+  }
+]

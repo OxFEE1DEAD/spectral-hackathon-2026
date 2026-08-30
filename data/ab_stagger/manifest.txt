@@ -1,0 +1,27 @@
+ab_bench run
+date_utc         : 2026-08-29T22:58:25Z
+commit           : c86cc26ab2e84996137f922cf175d33e9a622c29
+tree_dirty       : 52 file(s) modified
+blocks           : 6
+rate             : 200000
+samples_per_block: 2000000
+drop             : 16384
+warmup_ms        : 8000
+datagram         : 1472
+cores            : producer=1 sender=2 receiver=1 consumer=2
+offset_probe     : 0
+arm[0]           : baseline | send='' | recv=''
+arm[1]           : stagger | send='--stagger 64' | recv='--delivery bitmap'
+
+--- host sender ---
+kernel           : 7.0.0
+clock            : RMS offset      : 0.000000469 seconds
+clock            : Root dispersion : 0.000038448 seconds
+cores_total      : 4
+cores_available  : 1
+--- host receiver ---
+kernel           : 7.0.0
+clock            : RMS offset      : 0.000000371 seconds
+clock            : Root dispersion : 0.000033132 seconds
+cores_total      : 4
+cores_available  : 1

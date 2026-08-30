@@ -1,5 +1,0 @@
-measurement,direction,rtt_p50_ns,turnaround_p50_ns,oneway_p50_ns,offset_p50_ns,samples
-1,A-to-B,84606,28,42289,-6281,150000
-2,A-to-B,85177,28,42574,-2783,120000
-3,B-to-A,84483,19,42232,2489,120000
-4,A-to-B,85908,28,42940,228,20000

@@ -1,2 +1,0 @@
-run,rate,offset_pre_ns,offset_post_ns,offset_mean_ns,drift_ns,wire_measured_ns,wire_corrected_ns,total_measured_ns,total_corrected_ns
-xg_base_200k,200000,-4297,-3168,-3733,1129,32464,36197,32798,36531

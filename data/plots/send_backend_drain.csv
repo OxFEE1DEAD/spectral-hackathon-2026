@@ -1,4 +1,0 @@
-backend,runs,frames_per_datagram_mean,frames_per_datagram_min,frames_per_datagram_max,send_cycle_ns
-kernel-udp,5,2.3,2.24,2.35,11500
-io_uring,4,2.062,2.04,2.1,10312
-afxdp-copy,3,1.447,1.44,1.45,7233

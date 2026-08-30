@@ -1,5 +1,0 @@
-percentile,session1_base,session1_dual,session1_delta,session2_base,session2_dual,session2_delta,replicates
-p50,33071,36374,3303,34470,33287,-1183,sign flips
-p99,38788,45159,6371,39597,44092,4495,yes
-p99.9,57832,58122,290,51837,63581,11744,mixed
-p99.99,921223,159146,-762077,81133,259100,177967,sign flips

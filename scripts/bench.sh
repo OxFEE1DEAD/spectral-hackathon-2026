@@ -66,6 +66,13 @@ skip_core_check=0
 recv_spin=0
 recv_busy_poll=""
 send_method=""
+# Ours: see PROVENANCE.md. Passed through to the transport so the two delivery
+# policies can be interleaved inside one A/B block rather than compared across
+# separate builds minutes apart.
+stagger=""
+dup_trades=0
+delivery=""
+late_alloc=0
 no_duplicate=0
 stage_capture=0
 # Which mechanism moves datagrams. Both ends are kernel UDP sockets either way;
@@ -147,6 +154,10 @@ while [[ $# -gt 0 ]]; do
     --spin) recv_spin=1; shift ;;   # comparison only; busy-poll is the shipping mode
     --busy-poll) recv_busy_poll="$2"; shift 2 ;;  # force it, for the same comparison
     --send-method) send_method="$2"; shift 2 ;;   # auto|sendmmsg|sendto|connected
+    --stagger) stagger="$2"; shift 2 ;;
+    --dup-trades) dup_trades=1; shift ;;           # datagrams to hold a redundant copy back by
+    --delivery) delivery="$2"; shift 2 ;;
+    --late-alloc) late_alloc=1; shift ;;         # monotonic|bitmap
     --no-duplicate) no_duplicate=1; shift ;;      # isolate fan-out cost from redundancy
     --stages) stage_capture=1; shift ;;           # capture per-stage timings on receiver 0
     --backend) backend="$2"; shift 2 ;;           # udp|iouring
@@ -309,6 +320,8 @@ start_receivers() {
       --shm "${out_shm}${i}" --slots "$out_slots" --port "$((port + i))" \
       ${bind_addr:+--bind "$bind_addr"} --core "${rcores[$i]}" --idle-ms 0 \
       --backend "$backend" \
+      ${delivery:+--delivery "$delivery"} \
+      $( [[ $late_alloc -eq 1 ]] && echo --late-alloc ) \
       $( [[ $recv_spin -eq 1 ]] && echo --spin ) \
       ${recv_busy_poll:+--busy-poll "$recv_busy_poll"} \
       ${iou_poll:+--iou-poll "$iou_poll"} \
@@ -353,6 +366,8 @@ start_stream() {
     ${xdp_iface:+--xdp-iface "$xdp_iface" --xdp-queue "$xdp_queue"} \
     ${src_addr:+--src-addr "$src_addr"} \
     ${send_method:+--send-method "$send_method"} \
+    ${stagger:+--stagger "$stagger"} \
+    $( [[ $dup_trades -eq 1 ]] && echo --dup-trades ) \
     $( [[ $sqpoll -eq 1 ]] && echo --sqpoll ) \
     ${sq_core:+--sq-core "$sq_core"} \
     $( [[ $no_duplicate -eq 1 ]] && echo --no-duplicate ) &

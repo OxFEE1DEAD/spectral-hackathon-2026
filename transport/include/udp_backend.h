@@ -370,11 +370,23 @@ class Sender {
 
   // Send one datagram to every peer. Returns how many peers it reached, so partial
   // fan-out is accounted for rather than silently lost.
+  // Send one datagram to every peer, starting from a different peer each time. Returns how
+  // many peers it reached, so partial fan-out is accounted for rather than silently lost.
+  //
+  // The rotation is the point. Copying a datagram to n peers is n sequential handoffs to the
+  // kernel, so the peer served last waits for the n-1 before it -- and if the order never
+  // changes, that wait is the same peer's every single datagram. The result is not jitter
+  // that averages out across receivers; it is a fixed penalty attached to a fixed receiver,
+  // and it grows with n. Advancing the starting index by one per datagram costs an add and a
+  // compare, spreads the penalty evenly, and leaves every receiver with the same mean.
   int send_all(const void* buf, uint32_t len) {
+    const size_t n_peers = addrs_.size();
+    const size_t start = n_peers ? (rr_++ % n_peers) : 0;
     switch (method_) {
       case SendMethod::kConnected: {
         int reached = 0;
-        for (int fd : fds_) {
+        for (size_t k = 0; k < fds_.size(); ++k) {
+          const int fd = fds_[(start + k) % fds_.size()];
           if (::send(fd, buf, len, MSG_DONTWAIT) == static_cast<ssize_t>(len)) {
             ++reached;
           }
@@ -383,7 +395,8 @@ class Sender {
       }
       case SendMethod::kSendto: {
         int reached = 0;
-        for (size_t i = 0; i < addrs_.size(); ++i) {
+        for (size_t k = 0; k < n_peers; ++k) {
+          const size_t i = (start + k) % n_peers;
           if (::sendto(fds_[0], buf, len, MSG_DONTWAIT,
                        reinterpret_cast<sockaddr*>(&addrs_[i]),
                        sizeof(addrs_[i])) == static_cast<ssize_t>(len)) {
@@ -393,9 +406,12 @@ class Sender {
         return reached;
       }
       default: {
-        for (size_t i = 0; i < iov_.size(); ++i) {
-          iov_[i].iov_base = const_cast<void*>(buf);
-          iov_[i].iov_len = len;
+        // sendmmsg walks its array in order inside one syscall, so the same fixed penalty
+        // applies; rotating which address each slot carries is what spreads it.
+        for (size_t k = 0; k < msgs_.size(); ++k) {
+          iov_[k].iov_base = const_cast<void*>(buf);
+          iov_[k].iov_len = len;
+          msgs_[k].msg_hdr.msg_name = &addrs_[(start + k) % n_peers];
         }
         const int n = sendmmsg(fds_[0], msgs_.data(),
                                static_cast<unsigned>(msgs_.size()), MSG_DONTWAIT);
@@ -411,6 +427,7 @@ class Sender {
   SendMethod method_ = SendMethod::kConnected;
   bool tx_timestamp_ = false;
   uint32_t tx_next_id_ = 0;
+  size_t rr_ = 0;   // rotating start index for fan-out, see send_all
   std::vector<uint64_t> presend_;
   std::vector<uint32_t> tx_samples_;
   uint64_t tx_unmatched_ = 0;
