@@ -354,7 +354,23 @@ Read the **sign** first and the magnitude second. What a fixed order predicts is
 "larger skew" but skew that always points the same way — the same receiver behind on every
 datagram. That is the falsifiable part, and it is what rotation is supposed to destroy.
 
-## 7. Latency and loss against message rate
+At three receivers the prediction sharpens into something a single block can refute: the
+medians should come out **monotone in peer index**, `c0 < c1 < c2`, because each peer waits
+behind all the ones served before it. Nothing else about the system predicts that ordering.
+
+## 7. Absolute latency, and the tail in full
+
+Everything above is a difference. The task asks for the percentiles themselves, so here
+they are — with the caveat that governs them.
+
+An end-to-end figure is `receiver clock − sender clock`, so an absolute number carries
+whatever constant separates the two hosts' clocks, and section 9 measures that offset
+*moving* by up to ±1,400 ns between two arms of one block. The absolute values below are
+therefore correct to within an unquantified constant, are not comparable to the baseline's
+(different hardware: `m7i.metal-24xl` against `m7i.2xlarge`), and are not what any claim in
+this notebook rests on. They are here because a transport should state its numbers.
+
+## 8. Latency and loss against message rate
 """)
 
 code(r"""
@@ -477,6 +493,97 @@ if os.path.exists("data/ab_fanout/skew.csv"):
 else:
     print("data/ab_fanout/skew.csv not present")
 
+if os.path.exists("data/ab_fanout3/skew.csv"):
+    f3 = defaultdict(dict)
+    for r in csv.DictReader(open("data/ab_fanout3/skew.csv")):
+        f3[int(r["block"])][r["arm"]] = [float(r[k]) for k in ("c0_p50", "c1_p50", "c2_p50")]
+    print("\nThree receivers, six blocks. Medians per receiver, in peer order:\n")
+    print(f"  {'block':>5}  {'fixed  c0/c1/c2':<28}{'spread':>9}   {'rotating  c0/c1/c2':<28}{'spread':>9}")
+    mono, spread = defaultdict(int), defaultdict(list)
+    n = 0
+    for b in sorted(f3):
+        if len(f3[b]) < 2:
+            continue
+        n += 1
+        line = f"  {b:>5}  "
+        for arm in ("fixed", "rotate"):
+            v = f3[b][arm]
+            spread[arm].append(max(v) - min(v))
+            mono[arm] += v[0] < v[1] < v[2]
+            line += f"{'/'.join(f'{x:,.0f}' for x in v):<28}{max(v)-min(v):>9,.0f}   "
+        print(line)
+    print(f"\n  monotone c0 < c1 < c2:  fixed {mono['fixed']}/{n}, "
+          f"sign p={sign_p(mono['fixed'], n):.3f}   rotating {mono['rotate']}/{n}")
+    w = sum(1 for a, b_ in zip(spread["fixed"], spread["rotate"]) if b_ < a)
+    m = lambda v: sorted(v)[len(v) // 2]
+    print(f"  spread smaller with rotation: {w}/{n}, sign p={sign_p(w, n):.3f}"
+          f"   median {m(spread['fixed']):,.0f} -> {m(spread['rotate']):,.0f} ns")
+    print(f"\n  Growth per extra receiver: ~1,356 ns at two, {m(spread['fixed']):,.0f} ns at three")
+    print(f"  -- about 1.4 us each, which is the slope behind the baseline's 11.7 us at ten.")
+
+import json, re, glob
+
+def raw_percentiles(path):
+    # ab_bench.sh appends summarize.py --json output after a "#e2e" marker in each raw file.
+    txt = open(path).read()
+    i = txt.find("#e2e")
+    if i < 0:
+        return None
+    try:
+        rec = json.loads(txt[txt.index("[", i):])[0]
+    except Exception:
+        return None
+    return {k: rec[k]["median"] for k in ("min", "p50", "p99", "p99.9", "p99.99", "max")
+            if k in rec}
+
+def collect(d, arm):
+    out = []
+    for f in sorted(glob.glob(f"{d}/raw_ab_b*_{arm}.txt")):
+        r = raw_percentiles(f)
+        if r:
+            out.append(r)
+    return out
+
+def med(v):
+    v = sorted(v)
+    return v[len(v) // 2] if len(v) % 2 else 0.5 * (v[len(v)//2 - 1] + v[len(v)//2])
+
+KEYS = ["min", "p50", "p99", "p99.9", "p99.99", "max"]
+print("End-to-end latency in nanoseconds. Median across blocks of each arm's own figure;")
+print("the spread underneath is the lowest and highest block, which is the honest width.\n")
+print(f"  {'run / arm':<26}" + "".join(f"{k:>12}" for k in KEYS))
+SHOW = [("data/ab_100k_n12", "base", "100k, baseline"),
+        ("data/ab_100k_n12", "ours", "100k, ours"),
+        ("data/ab_alloc", "late", "200k, baseline"),
+        ("data/ab_alloc", "early", "200k, ours"),
+        ("data/sweep_500000", "base", "500k, baseline"),
+        ("data/sweep_500000", "ours", "500k, ours")]
+series = {}
+for d, arm, label in SHOW:
+    rows = collect(d, arm)
+    if not rows:
+        continue
+    series[label] = rows
+    print(f"  {label:<26}" + "".join(f"{med([r[k] for r in rows]):>12,.0f}" for k in KEYS))
+    print(f"  {'':<26}" + "".join(
+        f"{'[' + format(min(r[k] for r in rows), ',.0f') + ']':>12}" for k in KEYS))
+
+# Tail as a complementary CDF: the fraction of messages slower than a given latency.
+# Five points per arm is coarse, but it is the shape the percentiles describe and it is
+# what the committed summaries contain -- the per-message samples are hundreds of
+# megabytes per run and are not in the repository.
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+frac = {"p50": 0.5, "p99": 1e-2, "p99.9": 1e-3, "p99.99": 1e-4}
+for label, rows in series.items():
+    xs = [med([r[k] for r in rows]) / 1e3 for k in frac]
+    ax.plot(xs, list(frac.values()), marker="o",
+            ls="--" if "baseline" in label else "-", label=label)
+ax.set(xscale="log", yscale="log", xlabel="latency (us)",
+       ylabel="fraction of messages slower", title="Tail: complementary CDF")
+ax.grid(True, which="both", alpha=0.25)
+ax.legend(fontsize=8)
+fig.tight_layout(); plt.show()
+
 PCTS = [("e2e_p50", "p50"), ("e2e_p99", "p99"), ("e2e_p999", "p99.9"), ("e2e_p9999", "p99.99")]
 dirs = sorted(glob.glob("data/sweep_*"), key=lambda d: int(d.rsplit("_", 1)[1]))
 rows, loss = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
@@ -523,7 +630,7 @@ The four latency panels overlap. Four blocks cannot resolve a 1-3 us difference;
 what the twelve-block run at the top is for, and the band is drawn rather than quoted so
 this is visible rather than asserted.
 
-## 8. Why the end-to-end columns are hard
+## 9. Why the end-to-end columns are hard
 
 At p99 the end-to-end budget splits, over six blocks of 3.67M samples each, into
 source-ring wait ~460 ns, ring publish ~195 ns, and a wire leg of 22,000-26,000 ns.
@@ -581,7 +688,7 @@ the effect. The corrected numbers are not in this notebook. What the probe does 
 is the size of the uncertainty: **±1,400 ns between two arms of one block**, the same order
 as the p99 effect.
 
-## 9. The tail above p99.9 is one recurring event, and it should be counted, not averaged
+## 10. The tail above p99.9 is one recurring event, and it should be counted, not averaged
 """)
 
 code(r"""
@@ -644,7 +751,7 @@ found.** What was ruled out, each with the counter that rules it out:
   That narrows the stall to the receive path below our own userspace: NIC, driver, softirq.
   It does not exclude a stall on the device side, only CPU starvation.
 
-## 10. Measured and did not work
+## 11. Measured and did not work
 
 Reporting these is not modesty. Each was expected to help; the design that survives is the
 one whose failures are known.
@@ -656,10 +763,10 @@ one whose failures are known.
 | ENA interrupt moderation off | 5k/s: 17,030 → 16,963 ns (unchanged). 20k/s: 13,364 → 14,813 ns (worse). Busy-poll drives NAPI directly and never waits for the interrupt. |
 | `IP_TOS` = `IPTOS_LOWDELAY` | +6.6 us at p50 over four runs. Removed. |
 | io_uring send backend | e2e p50 median difference −402 ns against a between-block spread of 6,319; sign p = 0.625. |
-| AF_XDP | not attempted. The backend's own notes record this driver refusing `XDP_ZEROCOPY`, leaving `XDP_COPY` through `xsk_generic_xmit`, and section 8 bounds any transmit-side saving at roughly zero. |
-| hand-applied clock-offset correction | withdrawn, section 8. |
+| AF_XDP | not attempted. The backend's own notes record this driver refusing `XDP_ZEROCOPY`, leaving `XDP_COPY` through `xsk_generic_xmit`, and section 9 bounds any transmit-side saving at roughly zero. |
+| hand-applied clock-offset correction | withdrawn, section 9. |
 
-## 11. Constraints not accounted for
+## 12. Constraints not accounted for
 
 * **Loss was modelled, not observed.** Sections 4 and 5 inject independent and bursty loss
   with `netem`, and the burst parameters were chosen to resemble the baseline's reported
@@ -679,7 +786,7 @@ one whose failures are known.
   ceiling, not transport ceiling.
 * **The measured surface is narrow** — 100k to 500k msg/s, fan-out 1.
 * **Absolute cross-host latencies are not published**, only within-block differences,
-  because section 8 shows the clock offset is not stable enough to support anything else.
+  because section 9 shows the clock offset is not stable enough to support anything else.
 """)
 
 md(r"""

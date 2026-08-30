@@ -1,0 +1,66 @@
+#gate
+malformed       : 0
+malformed       : 0
+datagram gaps   : 2 (122 datagrams)
+malformed       : 0
+datagram gaps   : 0 (0 datagrams)
+datagram gaps   : 2 (186 datagrams)
+datagram reorder: 0
+datagram reorder: 0
+first-copy loss : 0.0000%
+datagram reorder: 0
+first-copy loss : 0.0033%
+duplicates recvd: 1237711
+#legs
+shm_ns           n=3671977 p50=1285 p99=3556 p99.9=4328 p99.99=7676 max=248344
+wire_ns          n=3671977 p50=25017 p99=35395 p99.9=74351 p99.99=2705255 max=3995333
+publish_ns       n=3671977 p50=50 p99=148 p99.9=302 p99.99=518 max=21690
+rx_delivery_ns   no samples
+#e2e
+[
+  {
+    "name": "ab_b4_rotate",
+    "runs": 3,
+    "reps": 1,
+    "consumers": 3,
+    "excluded_files": 0,
+    "samples_per_run": 5950848,
+    "samples_pooled": 5950848,
+    "min": {
+      "median": 21498,
+      "lo": 21498,
+      "hi": 21498
+    },
+    "p50": {
+      "median": 26927,
+      "lo": 26927,
+      "hi": 26927
+    },
+    "p99": {
+      "median": 38162,
+      "lo": 38162,
+      "hi": 38162
+    },
+    "p99.9": {
+      "median": 132314,
+      "lo": 132314,
+      "hi": 132314
+    },
+    "p99.99": {
+      "median": 3630748,
+      "lo": 3630748,
+      "hi": 3630748
+    },
+    "max": {
+      "median": 4150820,
+      "lo": 4150820,
+      "hi": 4150820
+    },
+    "_resolvable": {
+      "p50": true,
+      "p99": true,
+      "p99.9": true,
+      "p99.99": true
+    }
+  }
+]

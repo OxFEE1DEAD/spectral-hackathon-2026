@@ -48,11 +48,12 @@ def main(host, remote_dir, pat="*"):
         parts = line.split()
         print(f"{parts[0]:<22}{' '.join(parts[1:-1]):<28}{parts[-1]:>10}")
         m = re.match(r"ab_b(\d+)_(\w+)$", parts[0])
-        if m and len(parts) == 4:
-            rows.append((m.group(1), m.group(2), parts[1], parts[2], parts[3]))
-    if len(sys.argv) > 4:
+        if m and len(parts) >= 4:
+            rows.append([m.group(1), m.group(2)] + parts[1:])
+    if len(sys.argv) > 4 and rows:
+        n = max(len(r) for r in rows) - 3   # block, arm, ..., skew
         with open(sys.argv[4], "w") as fh:
-            fh.write("block,arm,c0_p50,c1_p50,skew\n")
+            fh.write("block,arm," + ",".join(f"c{i}_p50" for i in range(n)) + ",skew\n")
             for t in rows:
                 fh.write(",".join(t) + "\n")
         print(f"\nwrote {sys.argv[4]}")

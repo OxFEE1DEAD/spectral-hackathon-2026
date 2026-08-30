@@ -35,6 +35,32 @@ block at up to ±1,400 ns — the same order as the p99 difference being looked 
 number is measured, not assumed, and it is why several results below are reported rather
 than claimed.
 
+## The numbers
+
+End-to-end latency in nanoseconds, median across blocks, this bench, `--type mixed`:
+
+| | min | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| 100k msg/s, baseline | 9,978 | 12,130 | 19,984 | 35,670 | 965,068 | 2,084,559 |
+| 100k msg/s, **ours** | 9,534 | 11,977 | **18,397** | **30,744** | **57,032** | **220,408** |
+| 200k msg/s, baseline | 11,624 | 14,894 | 27,245 | 56,568 | 1,346,343 | 1,546,106 |
+| 200k msg/s, **ours** | 12,795 | 15,334 | **26,173** | **46,420** | **98,829** | **258,656** |
+| 500k msg/s, baseline | 14,318 | 20,420 | 37,879 | 61,358 | 127,888 | 181,760 |
+| 500k msg/s, ours | 14,808 | 20,956 | 41,438 | 65,688 | 127,691 | 227,590 |
+
+**Read these as this bench's numbers, not as a comparison with the baseline's published
+figures.** An end-to-end value is `receiver clock − sender clock`, so it carries whatever
+constant separates the two hosts; the offset between two arms of a single block was
+measured moving by up to ±1,400 ns, and its absolute size is unknown. The baseline was
+measured on `m7i.metal-24xl` sending to `m7i.24xlarge`, 96 vCPU against our 8. The rows
+above are directly comparable to each other because both arms ran minutes apart in the same
+block on the same pair of machines, and to nothing else.
+
+What the table shows and the deltas below confirm: the gain is concentrated **above p99**,
+it is largest at p99.99 where it is more than an order of magnitude, and p50 does not move.
+That is the shape the mechanism predicts — the changes remove datagrams from the receive
+path and remove a self-inflicted hole, neither of which touches the median.
+
 ## What is claimed
 
 Every row is a counterbalanced block A/B against a control arm that reproduces the
@@ -53,11 +79,13 @@ floor is `2 / 2^N`, so six blocks cannot go below 0.031 and twelve reach 0.0005.
 | cost of copying everything, e2e p99 | +4,955 ns | 6/6 | 0.031 |
 | under burst loss: staggered copy rescues | 5,538 frames, 96.7 % of protected Trades | 6/6 | 0.031 |
 | the same, cost at p99.9 | +298,410 ns | 6/6 | 0.031 |
-| fixed destination order puts the same peer behind | +1,356 ns median | 6/6 | 0.031 |
+| fixed destination order puts the same peer behind, two receivers | +1,356 ns median | 6/6 | 0.031 |
+| at three receivers, medians are monotone in peer index | `c0 < c1 < c2` | 6/6 | 0.031 |
+| rotation removes that ordering | 0/6 monotone | 6/6 | 0.031 |
+| rotation halves the spread across receivers | 2,808 → 1,217 ns | 6/6 | 0.031 |
 
-Deliberately absent: end-to-end p50, which never resolves; the *magnitude* of the fan-out
-skew reduction (4/5 blocks, p = 0.375); and the burst-loss rescue from an immediate copy,
-which is 3.8 % and indistinguishable from nothing.
+Deliberately absent: end-to-end p50, which never resolves; and the burst-loss rescue from
+an immediate copy, which is 3.8 % and indistinguishable from nothing.
 
 ## Four changes
 
@@ -151,12 +179,26 @@ behaviour in the same binary:
   claim the change is built on;
 * with rotation the direction is gone — 3 of 5 blocks, median +46 ns.
 
-**Not claimed**: the magnitude. `|skew|` falls in 4 of 5 usable blocks, sign p = 0.375, with
-the median dropping 1,260 → 105 ns. Two receivers need four isolated cores and this bench
-has three, so one consumer ran on the housekeeping core; one block's median went into the
-milliseconds and is dropped and counted. That is enough to establish the mechanism and its
-sign, not enough to trust the size or to extrapolate to the ten receivers the baseline
-reports.
+At two receivers the magnitude did not resolve — `|skew|` fell in 4 of 5 usable blocks,
+p = 0.375 — because two receivers need four isolated cores and that bench had three, so one
+consumer ran on the housekeeping core and one block's median went into the milliseconds.
+
+**At three receivers, on a host resized so six isolated cores were available and
+`check_cores.sh` passes without an override, it resolves and the prediction sharpens.** A
+fixed order does not merely produce "more skew": it produces medians **monotone in peer
+index**, because each peer waits behind every peer served before it. Nothing else about the
+system predicts that ordering, and a single block could have refuted it.
+
+| | fixed order | rotating |
+|---|---|---|
+| medians monotone `c0 < c1 < c2` | **6 of 6 blocks** | **0 of 6** |
+| spread across receivers, median | 2,808 ns | **1,217 ns**, smaller in 6 of 6 |
+
+Both at sign p = 0.031. The slope — about 1.4 µs per additional receiver, from 1,356 ns at
+two to 2,808 ns at three — is the one behind the baseline's reported 11.7 µs at ten.
+
+**Not claimed**: anything above three receivers. The slope is consistent with the
+baseline's figure; consistent is not measured.
 
 ### 4. A build failure fails the run
 
@@ -329,6 +371,21 @@ python3 -c "import nbformat; from nbclient import NotebookClient; \
 
 Every table in it is computed from `data/ab_*/blocks.csv` at execution time. Those CSVs are
 committed unedited, one row per arm-run, including the arm-runs that were marked invalid.
+
+### Fan-out
+
+Two receivers need four isolated cores and three need six, so the receiving host was
+resized to `m7i.4xlarge` for those runs. Changing the instance type discards the launch-time
+`cpu_options`, so SMT comes back on and the siblings must be taken offline again or the
+isolated cores share physical cores with housekeeping work:
+
+```bash
+for c in $(seq 8 15); do echo 0 | sudo tee /sys/devices/system/cpu/cpu$c/online; done
+```
+
+`isolcpus`/`nohz_full`/`rcu_nocbs` also have to be widened in
+`/etc/default/grub.d/99-bench.cfg` and the machine rebooted, which the stop/resize/start
+cycle provides. Verify with `scripts/check_cores.sh 1 2 3 4 5 6`.
 
 ### Cost
 

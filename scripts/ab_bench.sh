@@ -360,7 +360,7 @@ run_arm() {  # block index tag
 
   # Summarise where the data is; only kilobytes come back. A stage file at these rates is
   # hundreds of megabytes and fetching one is the least reliable step in a measurement.
-  sh_ "$recv_host" "cd $remote_dir && { echo '#gate'; grep -E 'published|suppressed|datagram reorder|datagram gaps|malformed|first-copy loss|duplicates recvd|arrived first|seq gaps' log_$tag | head -12;
+  sh_ "$recv_host" "cd $remote_dir && { echo '#gate'; grep -E 'published|suppressed|datagram reorder|datagram gaps|malformed|first-copy loss|duplicates recvd|arrived first|seq gaps' log_$tag | head -$((12 * receivers));
       echo '#legs'; for c in shm_ns wire_ns publish_ns rx_delivery_ns; do ./scripts/stage_pct.sh data/$tag/stages.csv \$c 2>/dev/null; done;
       echo '#e2e'; python3 ./scripts/summarize.py --drop $drop --json data/$tag 2>/dev/null; }" \
       > "$out_dir/raw_$tag.txt" 2>&1
