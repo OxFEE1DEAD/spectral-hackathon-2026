@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 
+#include "message.h"
 #include "metrics.h"
 #include "shm_ring.h"
 
@@ -107,7 +108,95 @@ static void test_ring_lapping() {
   printf("test_ring_lapping OK\n");
 }
 
+// ---- message format --------------------------------------------------------
+
+static void test_frame_size_follows_type() {
+  // Every type is a fixed size, which is why the header no longer carries a
+  // body_len. An unknown type must report 0 rather than a guess.
+  assert(msg::frame_size(static_cast<uint8_t>(msg::Type::Trade)) == sizeof(msg::Trade));
+  assert(msg::frame_size(static_cast<uint8_t>(msg::Type::Bbo)) == sizeof(msg::Bbo));
+  assert(msg::frame_size(static_cast<uint8_t>(msg::Type::OrderBook)) ==
+         sizeof(msg::OrderBook));
+  assert(msg::frame_size(0) == 0);
+  assert(msg::frame_size(99) == 0);
+  printf("test_frame_size_follows_type OK\n");
+}
+
+static void test_venue_timestamps_recover_exactly() {
+  // Venue timestamps travel as offsets from the message's own send_ts_ns so each
+  // frame stays self-contained. They must come back exact, not approximate.
+  msg::Header h{};
+  h.send_ts_ns = 1700000000123456789ull;
+  h.exch_ts_delta_ns = 4200;
+  h.match_ts_delta_ns = 130;
+  assert(msg::exchange_ts_ns(h) == h.send_ts_ns - 4200);
+  assert(msg::match_engine_ts_ns(h) == h.send_ts_ns - 4200 - 130);
+  printf("test_venue_timestamps_recover_exactly OK\n");
+}
+
+// The reason Trade carries running totals. A consumer tracking traded volume is
+// simulated two ways over a stream with one message lost: one accumulates the
+// per-trade quantity, the other reads the running total off each message.
+static void test_cumulative_totals_survive_loss() {
+  const uint64_t kCount = 10;
+  const uint64_t kLost = 4;
+
+  uint64_t truth_qty = 0;
+  std::vector<msg::Trade> stream;
+  for (uint64_t seq = 1; seq <= kCount; ++seq) {
+    msg::Trade m{};
+    m.header.seq_id = seq;
+    m.header.type = static_cast<uint8_t>(msg::Type::Trade);
+    m.price_ticks = 6500000 + static_cast<int64_t>(seq % 500) * 50;
+    m.quantity_lots = 1 + static_cast<int64_t>(seq % 100) * 10;
+    truth_qty += static_cast<uint64_t>(m.quantity_lots);
+    // The producer counts every trade it generates, whether or not it survives.
+    m.cum_quantity_lots = truth_qty;
+    m.cum_trade_count = seq;
+    stream.push_back(m);
+  }
+
+  uint64_t accumulating = 0;   // consumer that sums increments
+  uint64_t reading_total = 0;  // consumer that reads the running total
+  uint64_t seen = 0;
+  for (uint64_t i = 0; i < kCount; ++i) {
+    if (i == kLost) continue;  // the network drops this one
+    accumulating += static_cast<uint64_t>(stream[i].quantity_lots);
+    reading_total = stream[i].cum_quantity_lots;
+    ++seen;
+  }
+
+  assert(seen == kCount - 1);
+  // The accumulating consumer is permanently short and cannot detect it.
+  assert(accumulating < truth_qty);
+  // The one reading the running total is exactly right on the next message.
+  assert(reading_total == truth_qty);
+  printf("test_cumulative_totals_survive_loss OK "
+         "(accumulated=%llu, cumulative=%llu, truth=%llu)\n",
+         (unsigned long long)accumulating, (unsigned long long)reading_total,
+         (unsigned long long)truth_qty);
+}
+
+static void test_format_is_smaller_than_original() {
+  // The original harness format was Trade/Bbo 192 and OrderBook 576, so a mixed
+  // stream averaged 320 bytes. These assertions pin the improvement so a future
+  // change cannot quietly undo it.
+  assert(sizeof(msg::Trade) == 80);
+  assert(sizeof(msg::Bbo) == 64);
+  assert(sizeof(msg::OrderBook) == 160);
+  const double avg = (sizeof(msg::Trade) + sizeof(msg::Bbo) +
+                      sizeof(msg::OrderBook)) / 3.0;
+  assert(avg < 320.0 / 3.0 * 1.0);  // strictly better than the original average
+  printf("test_format_is_smaller_than_original OK "
+         "(mixed average %.1f vs 320 bytes; largest frame %u vs 576)\n",
+         avg, msg::kMaxFrame);
+}
+
 int main() {
+  test_frame_size_follows_type();
+  test_venue_timestamps_recover_exactly();
+  test_cumulative_totals_survive_loss();
+  test_format_is_smaller_than_original();
   test_metrics_basic();
   test_metrics_drops();
   test_ring_roundtrip();

@@ -1,0 +1,6 @@
+metric,value_ns,note
+tx_stamp_gap_p50,45776,userspace pre-send to kernel transmit stamp
+tx_stamp_gap_p99,70967,plateau begins
+tx_stamp_gap_p999,71173,206 ns above p99 -- a ceiling not a tail
+tx_completion_coalesce_ns,64000,transmit completion coalescing interval -- the plateau lands just above it
+corrected_wire_leg_p50,36197,pre-send to the receiver arrival stamp

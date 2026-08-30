@@ -25,21 +25,56 @@ harness/
 
 ## Message format
 
-Every message is a fixed-size, 64-byte-aligned struct beginning with a common
-`Header`, followed by type-specific market-data fields (`message.h`):
+> **This format has been reworked from the original harness definition.** The two
+> framing fields the consumer measures from are unchanged, and must stay that way.
+> Everything else was examined field by field. See `message.h` for the per-field
+> reasoning and the solution write-up for the full table.
+
+Every message is a fixed-size struct beginning with a common `Header`, followed by
+type-specific market-data fields (`message.h`):
 
 ```
-Header: seq_id (u64), send_ts_ns (u64), type (u16), version (u16), body_len (u32)
+Header (32 B): seq_id (u64), send_ts_ns (u64), instrument (u16), type (u8),
+               flags (u8), exch_ts_delta_ns (i32), match_ts_delta_ns (i32)
 
-Trade      symbol/venue/currencies, ids, price, quantity, aggressor side, flags, ...
-Bbo        symbol/venue, best bid/ask price+size, order counts, flags, ...
-OrderBook  symbol/venue, update ids, 5 bid levels + 5 ask levels, checksum, ...
+Trade      (80 B)  price_ticks, quantity_lots, trade_id,
+                   cum_quantity_lots, cum_notional_ticks, cum_trade_count
+Bbo        (64 B)  update_id, bid_price_ticks, spread_ticks, sizes, order counts
+OrderBook (160 B)  update_id, prev_update_gap, checksum,
+                   bid side + ask side (top price absolute, 4 levels as offsets)
 ```
 
-`seq_id` is a monotonic counter starting at 1; `send_ts_ns` is stamped
-immediately before publish. Those two `Header` fields are all the consumer needs
-to measure latency (recv_ts − send_ts_ns) and detect drops (gaps in seq_id) — it
-never has to interpret the body.
+`seq_id` is a monotonic counter starting at 1; `send_ts_ns` is stamped immediately
+before publish. Those two `Header` fields are all the consumer needs to measure
+latency (recv_ts − send_ts_ns) and detect drops (gaps in seq_id) — it never has to
+interpret the body.
+
+Four things worth understanding about why it looks like this:
+
+- **Prices and sizes are scaled integers only.** The original carried each of them
+  twice, once as a `double` and once as a scaled integer, plus `notional` which is
+  just price × quantity. Integers are the canonical exactly-representable form;
+  `kPriceTickSize` / `kQtyLotSize` convert if you want a double.
+- **Symbol, venue and currencies are reference data**, static for the session, so
+  they are a 2-byte `instrument` index into `kInstruments` rather than 48 bytes of
+  text on every message.
+- **`body_len` is gone** because each type is a fixed size — use `frame_size(type)`.
+  `version` is gone because it describes the protocol, not the message.
+- **`Trade` carries running totals** (`cum_*`). A trade is an event, so a lost trade
+  is lost information; a consumer that accumulates per-trade quantity is permanently
+  wrong after one missed message and cannot detect it, while one that reads the
+  running total is exactly correct again on the next trade. `Bbo` and `OrderBook`
+  need no equivalent because they are already state snapshots that self-correct.
+
+Nothing is encoded relative to a *previous message*, which is a deliberate
+constraint: delta-encoding each order book against the last one would be the single
+largest saving still available, and it would make one lost message corrupt every
+message after it. Every frame is self-contained.
+
+Net effect: a mixed stream averages **101 bytes** per message instead of 320, the
+largest frame is **160** instead of 576 — which shrinks every shared-memory ring
+slot from 640 to 192 bytes — and a 1500-byte datagram now carries 9 order books
+instead of 2.
 
 ## Basic transport: shared-memory broadcast ring
 
