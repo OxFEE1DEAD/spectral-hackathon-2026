@@ -327,6 +327,11 @@ make -C harness && make -C transport && make -C tools
 `ab_bench.sh` handles both hosts. It syncs the tree, builds on each, and refuses to run if
 either build fails.
 
+`bench-tx` and `bench-rx` below are `~/.ssh/config` aliases for the two machines, and
+`172.31.47.71` is the receiver's **private** address inside the VPC — the measured path must
+not go through a public address. Substitute your own; nothing about any particular host is
+baked into the scripts.
+
 ```bash
 scripts/ab_bench.sh \
   --send-host bench-tx --recv-host bench-rx --recv-ip 172.31.47.71 \
@@ -346,7 +351,7 @@ carries an unknown offset the size of the effect.
 ### The path, without trusting either clock
 
 Round trip on one clock, turnaround on the other, so no clock offset survives. Note this
-measures a UDP echo, not the physical path — see the correction above:
+measures a UDP echo, not the physical path — see the correction above. Addresses as above:
 
 ```bash
 # on the receiver
@@ -358,6 +363,60 @@ tools/bin/clock_probe --probe --peer 172.31.47.71:51902 --count 40000 --rate 200
 Run it at more than one rate. The path is rate-dependent: 17,030 ns one-way at 5,000/s and
 13,364 ns at 20,000/s, because at the lower rate the receive path goes cold between
 packets.
+
+### Injecting loss
+
+Sections 4 and 5 of the notebook need loss on the sender's egress. Independent:
+
+```bash
+sudo tc qdisc replace dev <iface> root netem loss 0.5%
+```
+
+Bursty, mean run of 20 datagrams at ~0.5 % overall — steady-state bad-state probability is
+`p / (p + r)` and mean burst length is `1 / r`:
+
+```bash
+sudo tc qdisc replace dev <iface> root netem loss gemodel 0.025% 5%
+```
+
+Remove it afterwards, and check that you did — a forgotten qdisc silently poisons every
+later run:
+
+```bash
+sudo tc qdisc del dev <iface> root
+tc qdisc show dev <iface>
+```
+
+### Latency and loss against rate
+
+```bash
+for R in 100000 200000 500000 1000000; do
+  scripts/ab_bench.sh --send-host bench-tx --recv-host bench-rx --recv-ip 172.31.47.71 \
+    --producer-core 1 --sender-core 2 --receiver-core 1 --consumer-core 2 \
+    --arm 'base | | --late-alloc' --arm 'ours | --dup-trades | ' \
+    --blocks 4 --rate $R --samples 2000000 --out data/sweep_$R
+done
+```
+
+At 1M msg/s the consumer collects nothing on this hardware and the run is kept as evidence
+of that ceiling rather than discarded.
+
+### Is the host taking the core away?
+
+Every other explanation for the 1-3 ms stall lives inside the relay. This one does not, and
+this bench is a *shared* instance rather than the bare-metal host the baseline used. Spin on
+a spare isolated core doing nothing but reading the clock, alongside a live run, and look at
+the gaps between iterations:
+
+```bash
+gcc -O2 -o /tmp/spin_gap scripts/spin_gap.c
+taskset -c 3 /tmp/spin_gap 3 55        # core, seconds
+awk '/^cpu /{print "steal ticks:", $9}' /proc/stat
+```
+
+Idle, partially loaded and under the full pipeline it reported zero gaps above 1 ms across
+~160 s, worst 148 us, with steal moving 0-1 ticks. That excludes CPU starvation and does not
+identify what remains.
 
 ### The notebook
 

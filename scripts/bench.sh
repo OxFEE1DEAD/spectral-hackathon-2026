@@ -66,7 +66,7 @@ skip_core_check=0
 recv_spin=0
 recv_busy_poll=""
 send_method=""
-# Ours: see PROVENANCE.md. Passed through to the transport so the two delivery
+# Ours: see SOLUTION.md. Passed through to the transport so the two delivery
 # policies can be interleaved inside one A/B block rather than compared across
 # separate builds minutes apart.
 stagger=""

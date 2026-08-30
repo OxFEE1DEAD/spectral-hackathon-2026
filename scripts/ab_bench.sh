@@ -398,7 +398,7 @@ for h in "$send_host" "$recv_host"; do
       "$root/" "$h:$remote_dir/" 2>/dev/null && break
     sleep 5
   done
-  # Ours: see PROVENANCE.md. `echo BUILD_OK` used to run unconditionally, so a compile
+  # Ours: see SOLUTION.md. `echo BUILD_OK` used to run unconditionally, so a compile
   # error left the previous binaries in place and the whole matrix was measured against
   # stale code that silently ignored the arm's flags. That is not a hypothetical: one
   # three-arm run recorded "no-data" for every block of the arm whose flag was new.

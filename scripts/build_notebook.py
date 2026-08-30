@@ -742,9 +742,9 @@ found.** What was ruled out, each with the counter that rules it out:
   about that rate.
 * **Interrupt moderation, THP, systemd timers** — none matched the period.
 * **The host taking the core away.** This is an `m7i.2xlarge`, a *shared* instance, not the
-  bare-metal host the baseline was measured on, and nothing above tested that. A thread
-  whose only instruction is a clock read, pinned to the spare isolated core, was run
-  alongside the relay and its inter-iteration gaps recorded. Over three runs — idle, partial
+  bare-metal host the baseline was measured on, and nothing above tested that.
+  `scripts/spin_gap.c` — a thread whose only instruction is a clock read, pinned to the
+  spare isolated core — was run alongside the relay and its inter-iteration gaps recorded. Over three runs — idle, partial
   load, full pipeline, ~160 s total — it saw **zero gaps above 1 ms**, worst 148 us, and
   `/proc/stat` steal moved by 0-1 ticks. The hypervisor is not taking the core.
 
